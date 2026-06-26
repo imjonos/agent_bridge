@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
-
 from ..agents.base import AgentAdapter, AgentResult, AgentStreamCallback
 from ..config import Settings
 from ..prompts.templates import build_builder_prompt, build_fix_prompt, build_reviewer_prompt
@@ -15,6 +13,7 @@ class WorkflowState:
     current_task: str | None = None
     last_builder_result: AgentResult | None = None
     last_reviewer_result: AgentResult | None = None
+    last_completed_role: str | None = None
     status: str = "waiting"
 
 
@@ -43,6 +42,7 @@ class Workflow:
         self.state.current_task = task
         self.state.last_builder_result = None
         self.state.last_reviewer_result = None
+        self.state.last_completed_role = None
         self.state.status = "waiting"
         self.history.append("task_created", {"task": task})
 
@@ -68,6 +68,7 @@ class Workflow:
         self.state.status = "running"
         result = self.builder.run(prompt, stream_callback=stream_callback)
         self.state.last_builder_result = result
+        self.state.last_completed_role = "builder"
         self.state.status = "success" if result.returncode == 0 else "error"
         self.history.append(
             event_type,
@@ -89,6 +90,7 @@ class Workflow:
         self.state.status = "running"
         result = self.reviewer.run(prompt, stream_callback=stream_callback)
         self.state.last_reviewer_result = result
+        self.state.last_completed_role = "reviewer"
         self.state.status = "success" if result.returncode == 0 else "error"
         self.history.append("reviewer_result", self._result_payload(result))
         return result

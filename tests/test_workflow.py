@@ -44,13 +44,33 @@ class WorkflowTests(TestCase):
 
             result = workflow.run_builder()
             self.assertEqual(result.stdout, "builder output")
+            self.assertEqual(workflow.state.last_completed_role, "builder")
             self.assertEqual(builder.prompts, ["Ты основной агент-разработчик.\n\nЗадача:\nImplement feature\n\nРаботай в проекте. Вноси изменения аккуратно.\nПосле выполнения кратко напиши:\n1. Что изменено.\n2. Какие файлы затронуты.\n3. Как проверить результат.\n4. Есть ли риски или незавершённые места.\n"])
 
             review = workflow.send_builder_to_reviewer()
             self.assertEqual(review.stdout, "OK")
+            self.assertEqual(workflow.state.last_completed_role, "reviewer")
 
             events = [record["type"] for record in history.read_current_session()]
             self.assertEqual(events[:3], ["task_created", "builder_result", "reviewer_result"])
 
             with self.assertRaises(WorkflowError):
                 workflow.send_review_back_to_builder()
+
+    def test_fix_updates_last_completed_role_to_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            settings = Settings(project_dir=str(project_dir))
+            history = HistoryService(project_dir / ".agent-bridge" / "test-history")
+            builder_result = AgentResult("codex", "builder", "builder prompt", "fixed output", "", 0, 1.2)
+            reviewer_result = AgentResult("opencode", "reviewer", "review prompt", "Need fixes", "", 0, 0.8)
+            builder = StubAgent("codex", "builder", builder_result)
+            reviewer = StubAgent("opencode", "reviewer", reviewer_result)
+            workflow = Workflow(settings=settings, builder=builder, reviewer=reviewer, history=history)
+
+            workflow.set_task("Implement feature")
+            workflow.run_builder()
+            workflow.send_builder_to_reviewer()
+            workflow.send_review_back_to_builder()
+
+            self.assertEqual(workflow.state.last_completed_role, "builder")

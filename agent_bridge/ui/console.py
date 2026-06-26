@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from textwrap import shorten
 from typing import Callable
@@ -10,7 +11,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Markdown, RichLog, Static, TextArea
+from textual.widgets import Header, RichLog, Static, TextArea
 
 from ..config import Settings
 from ..services.git_context import get_git_diff
@@ -98,10 +99,6 @@ class ConsoleApp(App[None], inherit_css=False):
     }
 
     #live_panel {
-        height: 2fr;
-    }
-
-    #result_panel {
         height: 1fr;
     }
 
@@ -124,11 +121,6 @@ class ConsoleApp(App[None], inherit_css=False):
         margin-top: 1;
     }
 
-    #result_output {
-        height: 1fr;
-        margin-top: 0;
-    }
-
     #live_log,
     #history_log {
         height: 1fr;
@@ -140,9 +132,9 @@ class ConsoleApp(App[None], inherit_css=False):
     BINDINGS = [
         Binding("ctrl+s", "save_task", "Save task", show=True),
         Binding("ctrl+n", "new_task", "New task", show=False),
-        Binding("ctrl+b", "run_builder", "Builder", show=False),
-        Binding("ctrl+r", "send_to_reviewer", "Reviewer", show=False),
-        Binding("ctrl+f", "fix_builder", "Fix", show=False),
+        Binding("ctrl+u", "run_next", "Run", show=False),
+        Binding("ctrl+b", "run_build", "Build", show=False),
+        Binding("ctrl+r", "run_review", "Review", show=False),
         Binding("ctrl+d", "show_diff", "Diff", show=False),
         Binding("ctrl+t", "run_tests", "Tests", show=False),
         Binding("ctrl+h", "show_history", "Timeline", show=False),
@@ -162,9 +154,10 @@ class ConsoleApp(App[None], inherit_css=False):
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
+        self._final_result_text = ""
         self._usage = {
-            "builder": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0},
-            "reviewer": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0},
+            "builder": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
+            "reviewer": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
         }
 
     def compose(self) -> ComposeResult:
@@ -197,10 +190,6 @@ class ConsoleApp(App[None], inherit_css=False):
                     yield Static(Text(self._t("live_output_title"), style="bold white"), id="live_title")
                     yield Static(id="live_meta")
                     yield RichLog(id="live_log", markup=True, wrap=True, auto_scroll=True)
-                with Container(id="result_panel", classes="panel"):
-                    yield Static(Text(self._t("final_result_title"), style="bold white"), id="result_title")
-                    yield Static(id="result_meta")
-                    yield Markdown(self._t("final_result_empty"), id="result_output")
         with Container(id="menu_panel"):
             yield Static(
                 Text(self._t("commands_title"), style="bold white"),
@@ -227,10 +216,12 @@ class ConsoleApp(App[None], inherit_css=False):
         self.workflow.state.current_task = None
         self.workflow.state.last_builder_result = None
         self.workflow.state.last_reviewer_result = None
+        self.workflow.state.last_completed_role = None
         self.workflow.state.status = "waiting"
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
+        self._final_result_text = ""
         self._task_editor().clear()
         self._set_message(self._t("new_task_title"))
         self._append_activity(self._t("new_task_title"), self._t("new_task_activity"), style="cyan")
@@ -242,14 +233,27 @@ class ConsoleApp(App[None], inherit_css=False):
         self._set_message(self._t("task_cleared"))
         self._task_editor().focus()
 
-    def action_run_builder(self) -> None:
+    def action_run_next(self) -> None:
+        next_action = self._next_run_action()
+        if next_action == "reviewer":
+            self._start_worker("reviewer", self._reviewer_worker, self._set_message)
+            return
+        if next_action == "builder_fix":
+            self._start_worker("builder_fix", self._fix_worker, self._set_message)
+            return
+        if next_action == "done":
+            self._set_message(self._t("run_queue_done"))
+            return
         self._start_worker("builder", self._builder_worker, self._set_message)
 
-    def action_send_to_reviewer(self) -> None:
-        self._start_worker("reviewer", self._reviewer_worker, self._set_message)
+    def action_run_build(self) -> None:
+        if self._should_apply_review_feedback():
+            self._start_worker("builder_fix", self._fix_worker, self._set_message)
+            return
+        self._start_worker("builder", self._builder_worker, self._set_message)
 
-    def action_fix_builder(self) -> None:
-        self._start_worker("builder_fix", self._fix_worker, self._set_message)
+    def action_run_review(self) -> None:
+        self._start_worker("reviewer", self._reviewer_worker, self._set_message)
 
     def action_show_diff(self) -> None:
         self._start_worker("tools", self._git_diff_worker, self._set_message)
@@ -283,6 +287,7 @@ class ConsoleApp(App[None], inherit_css=False):
         self.workflow.set_task(text)
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
+        self._final_result_text = ""
         self._refresh_ui()
         self._refresh_history_log()
         self._append_activity(self._t("task_log_title"), f"{self._t('saved_task')}: {self._task_summary(text)}", style="green")
@@ -344,19 +349,19 @@ class ConsoleApp(App[None], inherit_css=False):
         title = "Builder fix" if is_fix else "Builder"
         self._builder_status = "success" if result.returncode == 0 else "error"
         self._set_message(self._t("builder_done"))
-        self._update_result_widgets(title, result, self._builder_status)
         self._update_usage("builder", result)
         self._refresh_history_log()
         self._append_activity(title, self._result_summary(result), style="green" if result.returncode == 0 else "red")
+        self._update_final_result(title, result, self._builder_status)
         self._refresh_status_card()
 
     def _handle_reviewer_result(self, result) -> None:
         self._reviewer_status = "success" if result.returncode == 0 else "error"
         self._set_message(self._t("reviewer_done"))
-        self._update_result_widgets("Reviewer", result, self._reviewer_status)
         self._update_usage("reviewer", result)
         self._refresh_history_log()
         self._append_activity("Reviewer", self._result_summary(result), style="green" if result.returncode == 0 else "red")
+        self._update_final_result("Reviewer", result, self._reviewer_status)
         self._refresh_status_card()
 
     def _handle_diff_result(self, diff: str) -> None:
@@ -390,12 +395,8 @@ class ConsoleApp(App[None], inherit_css=False):
         self.workflow.state.status = "error"
         if title.startswith("Builder"):
             self._builder_status = "error"
-            if self._ui_ready:
-                self._result_meta().update(self._render_agent_meta("Builder", self.settings.builder_agent, None, self._builder_status))
         elif title == "Reviewer":
             self._reviewer_status = "error"
-            if self._ui_ready:
-                self._result_meta().update(self._render_agent_meta("Reviewer", self.settings.reviewer_agent, None, self._reviewer_status))
         self._append_activity(title, message, style="red")
         self._set_error(f"{title}: {message}")
         self._refresh_status_card()
@@ -444,21 +445,20 @@ class ConsoleApp(App[None], inherit_css=False):
             return
         result = self.workflow.state.last_reviewer_result or self.workflow.state.last_builder_result
         if result is None:
-            self._result_meta().update(self._render_agent_meta("Result", "-", None, "waiting"))
-            self._result_output().update(self._t("final_result_empty"))
+            self._final_result_text = ""
             self._live_meta().update(self._render_live_meta())
             return
+        self._live_log().clear()
         title = "Reviewer" if result.role == "reviewer" else "Builder"
         status = "success" if result.returncode == 0 else "error"
-        self._update_result_widgets(title, result, status)
+        self._update_final_result(title, result, status)
 
-    def _update_result_widgets(self, title: str, result, status: str) -> None:
+    def _update_final_result(self, title: str, result, status: str) -> None:
         if not self._ui_ready:
             return
-        self._result_meta().update(self._render_agent_meta(title, result.agent_name, result, status))
-        output = result.text or result.stderr.strip() or self._t("empty_output")
-        self._result_output().update(output)
+        self._final_result_text = result.text or result.stderr.strip() or self._t("empty_output")
         self._live_meta().update(self._render_live_meta())
+        self._append_final_result(title, result, status)
 
     def _render_status_card(self) -> Table:
         table = Table.grid(expand=True)
@@ -485,13 +485,14 @@ class ConsoleApp(App[None], inherit_css=False):
         table.add_column(ratio=2)
         for role in ("builder", "reviewer"):
             usage = self._usage[role]
+            tokens = str(usage["tokens"]) if usage["tokens_known"] else self._t("usage_tokens_unknown")
             table.add_row(
                 Text(role, style="grey70"),
                 Text(
                     self._t("usage_runs").format(
                         runs=usage["runs"],
                         duration=usage["duration"],
-                        tokens=usage["tokens"],
+                        tokens=tokens,
                     ),
                     style="white",
                 ),
@@ -541,6 +542,13 @@ class ConsoleApp(App[None], inherit_css=False):
         self._live_meta().update(self._render_live_meta())
         self._append_activity(title, self._t("process_started"), style="yellow")
 
+    def _append_final_result(self, title: str, result, status: str) -> None:
+        log = self._live_log()
+        log.write(Text(""))
+        log.write(self._render_agent_meta(title, result.agent_name, result, status))
+        log.write(Text(self._t("final_result_title"), style="bold white"))
+        log.write(Text(self._final_result_text))
+
     def _append_live_output(self, title: str, stream_name: str, line: str) -> None:
         if not self._ui_ready or not line:
             return
@@ -560,7 +568,10 @@ class ConsoleApp(App[None], inherit_css=False):
         usage["duration"] += result.duration_sec
         usage["stdout"] += len(result.stdout)
         usage["stderr"] += len(result.stderr)
-        usage["tokens"] += self._extract_token_usage(result.stdout + "\n" + result.stderr)
+        tokens = self._extract_token_usage(result.stdout + "\n" + result.stderr)
+        if tokens is not None:
+            usage["tokens"] += tokens
+            usage["tokens_known"] = True
         self._refresh_usage_card()
 
     def _render_menu_text(self, commands: list[tuple[str, str]]) -> Text:
@@ -576,9 +587,9 @@ class ConsoleApp(App[None], inherit_css=False):
         return [
             ("^S", self._t("save")),
             ("^N", self._t("new")),
+            ("^U", self._t("command_run")),
             ("^B", self._t("command_build")),
             ("^R", self._t("command_review")),
-            ("^F", self._t("command_fix")),
         ]
 
     def _menu_commands_second_row(self) -> list[tuple[str, str]]:
@@ -638,14 +649,12 @@ class ConsoleApp(App[None], inherit_css=False):
             self.workflow.state.status = "running"
             self._active_role = "Builder"
             if self._ui_ready:
-                self._result_meta().update(self._render_agent_meta("Builder", self.settings.builder_agent, None, self._builder_status))
                 self._live_meta().update(self._render_live_meta())
         elif action == "reviewer":
             self._reviewer_status = "running"
             self.workflow.state.status = "running"
             self._active_role = "Reviewer"
             if self._ui_ready:
-                self._result_meta().update(self._render_agent_meta("Reviewer", self.settings.reviewer_agent, None, self._reviewer_status))
                 self._live_meta().update(self._render_live_meta())
         elif action == "tools":
             self.workflow.state.status = "running"
@@ -659,7 +668,6 @@ class ConsoleApp(App[None], inherit_css=False):
         self.query_one("#usage_title", Static).update(Text(self._t("usage_title"), style="bold white"))
         self.query_one("#history_title", Static).update(Text(self._t("history_title"), style="bold white"))
         self.query_one("#live_title", Static).update(Text(self._t("live_output_title"), style="bold white"))
-        self.query_one("#result_title", Static).update(Text(self._t("final_result_title"), style="bold white"))
         self.query_one("#menu_hint", Static).update(Text(self._t("commands_title"), style="bold white"))
         self.query_one("#menu_commands_1", Static).update(self._render_menu_text(self._menu_commands_first_row()))
         self.query_one("#menu_commands_2", Static).update(self._render_menu_text(self._menu_commands_second_row()))
@@ -686,12 +694,6 @@ class ConsoleApp(App[None], inherit_css=False):
 
     def _live_meta(self) -> Static:
         return self.query_one("#live_meta", Static)
-
-    def _result_meta(self) -> Static:
-        return self.query_one("#result_meta", Static)
-
-    def _result_output(self) -> Markdown:
-        return self.query_one("#result_output", Markdown)
 
     def _live_log(self) -> RichLog:
         return self.query_one("#live_log", RichLog)
@@ -736,14 +738,97 @@ class ConsoleApp(App[None], inherit_css=False):
             return "yellow"
         return "white"
 
+    def _should_apply_review_feedback(self) -> bool:
+        if self.workflow.state.last_completed_role != "reviewer":
+            return False
+        review = self.workflow.state.last_reviewer_result
+        if review is None:
+            return False
+        return review.text.strip().upper() != "OK"
+
+    def _next_run_action(self) -> str:
+        last_completed_role = self.workflow.state.last_completed_role
+        if self.workflow.state.last_builder_result is None or last_completed_role is None:
+            return "builder"
+        if last_completed_role == "builder":
+            return "reviewer"
+        if last_completed_role == "reviewer" and self._should_apply_review_feedback():
+            return "builder_fix"
+        return "done"
+
+    @classmethod
+    def _extract_token_usage(cls, text: str) -> int | None:
+        totals: list[int] = []
+        totals.extend(cls._extract_json_token_usage(text))
+        text_lines = [
+            line
+            for line in text.splitlines()
+            if not (line.strip().startswith("{") and line.strip().endswith("}"))
+        ]
+        text_without_json = "\n".join(text_lines)
+
+        token_context = r"(?:total|used|usage|spent|consumed|input|prompt|output|completion)"
+        for match in re.finditer(
+            rf"\b{token_context}[\w\s.-]{{0,32}}(?:tokens?|tok)\D{{0,12}}([\d,]+)\b",
+            text_without_json,
+            re.IGNORECASE,
+        ):
+            totals.append(int(match.group(1).replace(",", "")))
+        for match in re.finditer(
+            rf"\b([\d,]+)\s+(?:tokens?|tok)\b[\w\s./-]{{0,32}}\b(?:{token_context})\b",
+            text_without_json,
+            re.IGNORECASE,
+        ):
+            totals.append(int(match.group(1).replace(",", "")))
+
+        return sum(totals) if totals else None
+
     @staticmethod
-    def _extract_token_usage(text: str) -> int:
-        explicit_total = 0
-        for match in re.finditer(r"([\d,]+)\s+(?:tokens?|tok)\b", text, re.IGNORECASE):
-            explicit_total += int(match.group(1).replace(",", ""))
-        if explicit_total:
-            return explicit_total
-        return max(1, len(text) // 4) if text.strip() else 0
+    def _extract_json_token_usage(text: str) -> list[int]:
+        totals: list[int] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            total = ConsoleApp._json_token_total(value)
+            if total is not None:
+                totals.append(total)
+        return totals
+
+    @staticmethod
+    def _json_token_total(value: object) -> int | None:
+        if isinstance(value, dict):
+            direct_keys = ("total_tokens", "totalTokens", "tokens_total", "tokensTotal")
+            for key in direct_keys:
+                direct_value = value.get(key)
+                if isinstance(direct_value, int):
+                    return direct_value
+            token_keys = (
+                "input_tokens",
+                "inputTokens",
+                "prompt_tokens",
+                "promptTokens",
+                "output_tokens",
+                "outputTokens",
+                "completion_tokens",
+                "completionTokens",
+            )
+            subtotal = sum(item for key in token_keys if isinstance((item := value.get(key)), int))
+            if subtotal:
+                return subtotal
+            for nested in value.values():
+                total = ConsoleApp._json_token_total(nested)
+                if total is not None:
+                    return total
+        if isinstance(value, list):
+            subtotals = [total for item in value if (total := ConsoleApp._json_token_total(item)) is not None]
+            if subtotals:
+                return sum(subtotals)
+        return None
 
     def _render_command_result(self, command: str, stdout: str, stderr: str, returncode: int) -> Text:
         text = Text()

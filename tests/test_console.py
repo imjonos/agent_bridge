@@ -19,6 +19,7 @@ class FakeWorkflow:
             current_task=None,
             last_builder_result=None,
             last_reviewer_result=None,
+            last_completed_role=None,
             status="waiting",
         )
         self.history = history
@@ -72,3 +73,18 @@ class ConsoleTests(TestCase):
 
         self.assertTrue(used_keys)
         self.assertLessEqual(used_keys, set(TRANSLATIONS["en"]))
+
+    def test_extract_token_usage_reads_json_usage(self) -> None:
+        text = '{"usage":{"input_tokens":1200,"output_tokens":345}}'
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 1545)
+
+    def test_extract_token_usage_reads_textual_total(self) -> None:
+        text = "Token usage: total tokens: 2,048"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 2048)
+
+    def test_extract_token_usage_does_not_guess_from_output_length(self) -> None:
+        text = "Normal agent output without usage metadata."
+
+        self.assertIsNone(ConsoleApp._extract_token_usage(text))
