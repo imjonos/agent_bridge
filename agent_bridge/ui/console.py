@@ -13,12 +13,13 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Header, RichLog, Static, TextArea
 
 from ..config import Settings
 from ..services.git_context import get_git_diff
 from ..services.history import HistoryService
-from ..services.runner import run_shell_command
+from ..services.runner import run_shell_command, terminate_active_processes
 from ..services.workflow import Workflow, WorkflowError
 from .translations import DEFAULT_LANGUAGE, Language, SUPPORTED_LANGUAGES, translate
 
@@ -130,12 +131,12 @@ class ConsoleApp(App[None], inherit_css=False):
     BINDINGS = [
         Binding("ctrl+s", "save_task", "Save task", show=True),
         Binding("ctrl+n", "new_task", "New task", show=False),
-        Binding("ctrl+u", "run_next", "Run", show=False),
+        Binding("f5", "run_next", "Go", show=False),
+        Binding("f6", "stop_running", "Stop", show=False),
         Binding("ctrl+b", "run_build", "Build", show=False),
         Binding("ctrl+r", "run_review", "Review", show=False),
         Binding("ctrl+d", "show_diff", "Diff", show=False),
         Binding("ctrl+t", "run_tests", "Tests", show=False),
-        Binding("ctrl+h", "show_history", "Timeline", show=False),
         Binding("ctrl+l", "clear_activity", "Clear", show=False),
         Binding("ctrl+g", "toggle_language", "Language", show=True),
         Binding("ctrl+q", "quit", "Exit", show=True),
@@ -152,6 +153,7 @@ class ConsoleApp(App[None], inherit_css=False):
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
+        self._stop_requested = False
         self._usage = {
             "builder": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
             "reviewer": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
@@ -226,6 +228,9 @@ class ConsoleApp(App[None], inherit_css=False):
         self._task_editor().focus()
 
     def action_run_next(self) -> None:
+        self._stop_requested = False
+        if not self._autosave_task_before_run():
+            return
         next_action = self._next_run_action()
         if next_action == "reviewer":
             self._start_worker("reviewer", self._reviewer_worker, self._set_message)
@@ -239,18 +244,39 @@ class ConsoleApp(App[None], inherit_css=False):
         self._start_worker("builder", self._builder_worker, self._set_message)
 
     def action_run_build(self) -> None:
+        self._stop_requested = False
+        if not self._autosave_task_before_run():
+            return
         if self._should_apply_review_feedback():
             self._start_worker("builder_fix", self._fix_worker, self._set_message)
             return
         self._start_worker("builder", self._builder_worker, self._set_message)
 
     def action_run_review(self) -> None:
+        self._stop_requested = False
         self._start_worker("reviewer", self._reviewer_worker, self._set_message)
 
+    def action_stop_running(self) -> None:
+        stopped = terminate_active_processes()
+        if not stopped:
+            self._set_message(self._t("stop_no_active_run"))
+            return
+        self._stop_requested = True
+        self.workflow.state.status = "stopped"
+        if self._active_role.startswith("Reviewer"):
+            self._reviewer_status = "stopped"
+        elif self._active_role.startswith("Builder"):
+            self._builder_status = "stopped"
+        self._set_message(self._t("stop_requested"))
+        self._append_activity(self._t("command_stop"), self._t("stop_requested"), style="yellow")
+        self._refresh_status_card()
+
     def action_show_diff(self) -> None:
+        self._stop_requested = False
         self._start_worker("tools", self._git_diff_worker, self._set_message)
 
     def action_run_tests(self) -> None:
+        self._stop_requested = False
         self._start_worker("tools", self._tests_worker, self._set_message)
 
     def action_show_history(self) -> None:
@@ -282,6 +308,18 @@ class ConsoleApp(App[None], inherit_css=False):
         self._refresh_ui()
         self._refresh_history_log()
         self._append_activity(self._t("task_log_title"), f"{self._t('saved_task')}: {self._task_summary(text)}", style="green")
+
+    def _autosave_task_before_run(self) -> bool:
+        text = self._task_editor().text
+        task = text.strip()
+        if task == (self.workflow.state.current_task or ""):
+            return True
+        try:
+            self.save_task_text(text)
+        except WorkflowError as exc:
+            self._set_error(str(exc))
+            return False
+        return True
 
     def _start_worker(self, group: str, worker: Callable[[], None], status_message: Callable[[str], None]) -> None:
         status_message(self._t("run_started"))
@@ -338,6 +376,8 @@ class ConsoleApp(App[None], inherit_css=False):
 
     def _handle_builder_result(self, result, is_fix: bool = False) -> None:
         title = "Builder fix" if is_fix else "Builder"
+        if self._handle_stopped_result(title):
+            return
         self._builder_status = "success" if result.returncode == 0 else "error"
         self._set_message(self._t("builder_done"))
         self._update_usage("builder", result)
@@ -347,6 +387,8 @@ class ConsoleApp(App[None], inherit_css=False):
         self._refresh_status_card()
 
     def _handle_reviewer_result(self, result) -> None:
+        if self._handle_stopped_result("Reviewer"):
+            return
         self._reviewer_status = "success" if result.returncode == 0 else "error"
         self._set_message(self._t("reviewer_done"))
         self._update_usage("reviewer", result)
@@ -364,6 +406,8 @@ class ConsoleApp(App[None], inherit_css=False):
         self._refresh_status_card()
 
     def _handle_tests_result(self, result) -> None:
+        if self._handle_stopped_result(self._t("tests_title")):
+            return
         self.workflow.state.status = "success" if result.returncode == 0 else "error"
         self._set_message(self._t("tests_done"))
         self.workflow.history.append(
@@ -420,7 +464,9 @@ class ConsoleApp(App[None], inherit_css=False):
     def _refresh_history_log(self) -> None:
         if not self._ui_ready:
             return
-        log = self._history_log()
+        log = self._history_log_or_none()
+        if log is None:
+            return
         log.clear()
         for record in self.history.read_current_session():
             log.write(self._render_history_entry(record))
@@ -566,7 +612,8 @@ class ConsoleApp(App[None], inherit_css=False):
         return [
             ("^S", self._t("save")),
             ("^N", self._t("new")),
-            ("^U", self._t("command_run")),
+            ("F5", self._t("command_go")),
+            ("F6", self._t("command_stop")),
             ("^B", self._t("command_build")),
             ("^R", self._t("command_review")),
         ]
@@ -575,7 +622,6 @@ class ConsoleApp(App[None], inherit_css=False):
         return [
             ("^D", self._t("command_diff")),
             ("^T", self._t("command_tests")),
-            ("^H", self._t("history_title")),
             ("^L", self._t("clear")),
             ("^G", self._t("config_language")),
             ("^Q", self._t("exit")),
@@ -633,14 +679,32 @@ class ConsoleApp(App[None], inherit_css=False):
             self._active_role = "Reviewer"
         elif action == "tools":
             self.workflow.state.status = "running"
+            self._active_role = self._t("tests_title")
         self._set_message(self._t("run_started"))
         self._refresh_status_card()
+
+    def _handle_stopped_result(self, title: str) -> bool:
+        if not self._stop_requested:
+            return False
+        self.workflow.state.status = "stopped"
+        if title.startswith("Builder"):
+            self._builder_status = "stopped"
+        elif title == "Reviewer":
+            self._reviewer_status = "stopped"
+        self._stop_requested = False
+        self._set_message(self._t("run_stopped"))
+        self._append_activity(title, self._t("run_stopped"), style="yellow")
+        self._refresh_status_card()
+        return True
 
     def _refresh_translated_text(self) -> None:
         if not self._ui_ready:
             return
         self.query_one("#task_title", Static).update(Text(self._t("task_title"), style="bold white"))
-        self.query_one("#history_title", Static).update(Text(self._t("history_title"), style="bold white"))
+        try:
+            self.query_one("#history_title", Static).update(Text(self._t("history_title"), style="bold white"))
+        except NoMatches:
+            pass
         self.query_one("#live_title", Static).update(Text(self._t("live_output_title"), style="bold white"))
         self.query_one("#menu_hint", Static).update(Text(self._t("commands_title"), style="bold white"))
         self.query_one("#menu_commands_1", Static).update(self._render_menu_text(self._menu_commands_first_row()))
@@ -671,6 +735,12 @@ class ConsoleApp(App[None], inherit_css=False):
     def _history_log(self) -> RichLog:
         return self.query_one("#history_log", RichLog)
 
+    def _history_log_or_none(self) -> RichLog | None:
+        try:
+            return self._history_log()
+        except NoMatches:
+            return None
+
     def _set_task_editor(self, text: str) -> None:
         self._task_editor().load_text(text)
 
@@ -680,11 +750,12 @@ class ConsoleApp(App[None], inherit_css=False):
             "running": "black on yellow",
             "success": "black on green",
             "error": "white on red",
+            "stopped": "black on bright_yellow",
         }
         return Text(f" {self._status_label(status)} ", style=styles.get(status, "white on black"))
 
     def _status_label(self, status: str) -> str:
-        return self._t(f"status_{status}") if status in {"waiting", "running", "success", "error"} else status.upper()
+        return self._t(f"status_{status}") if status in {"waiting", "running", "success", "error", "stopped"} else status.upper()
 
     @staticmethod
     def _status_text_style(status: str) -> str:
@@ -693,12 +764,11 @@ class ConsoleApp(App[None], inherit_css=False):
             "running": "yellow",
             "success": "green",
             "error": "red",
+            "stopped": "yellow",
         }.get(status, "white")
 
     @staticmethod
     def _stream_line_style(stream_name: str, line: str) -> str:
-        if stream_name == "stderr":
-            return "red"
         if re.search(r"\b(error|failed|exception|traceback|fatal)\b", line, re.IGNORECASE):
             return "red"
         if re.search(r"\b(warn|warning|retry)\b", line, re.IGNORECASE):
@@ -708,8 +778,8 @@ class ConsoleApp(App[None], inherit_css=False):
     def _render_stream_line(self, title: str, stream_name: str, line: str, style: str | None = None) -> Text:
         style = style or self._stream_line_style(stream_name, line)
         is_error_stream = stream_name == "stderr"
-        badge = "err" if is_error_stream else "out"
-        badge_style = "white on red" if is_error_stream else "black on cyan"
+        badge = "log" if is_error_stream else "out"
+        badge_style = "black on yellow" if is_error_stream else "black on cyan"
         rail_style = "red" if style == "red" else "yellow" if style == "yellow" else "cyan"
 
         text = Text()
@@ -720,7 +790,7 @@ class ConsoleApp(App[None], inherit_css=False):
         text.append(" ")
 
         content = Text.from_ansi(line.rstrip("\n"))
-        if is_error_stream or not content.spans:
+        if not content.spans:
             content.stylize(style)
         text.append_text(content)
         return text

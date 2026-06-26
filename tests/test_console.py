@@ -71,6 +71,52 @@ class ConsoleTests(TestCase):
 
         self.assertEqual(russian_keys, english_keys)
 
+    def test_run_binding_uses_f5_go(self) -> None:
+        bindings = {binding.action: binding for binding in ConsoleApp.BINDINGS}
+
+        self.assertEqual(bindings["run_next"].key, "f5")
+        self.assertEqual(bindings["run_next"].description, "Go")
+        self.assertEqual(bindings["stop_running"].key, "f6")
+        self.assertEqual(bindings["stop_running"].description, "Stop")
+        self.assertNotIn("show_history", bindings)
+
+    def test_menu_shows_f5_go_and_hides_timeline_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            first_row = app._render_menu_text(app._menu_commands_first_row()).plain
+            second_row = app._render_menu_text(app._menu_commands_second_row()).plain
+
+            self.assertIn("F5 Go", first_row)
+            self.assertIn("F6 Stop", first_row)
+            self.assertNotIn("^U", first_row)
+            self.assertNotIn("^H", second_row)
+            self.assertNotIn("Timeline", second_row)
+
+    def test_autosave_before_run_saves_changed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            app._task_editor = lambda: SimpleNamespace(text="new task")  # type: ignore[method-assign]
+
+            self.assertTrue(app._autosave_task_before_run())
+            self.assertEqual(app.workflow.state.current_task, "new task")
+
+    def test_autosave_before_run_skips_unchanged_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            app.workflow.state.current_task = "saved task"
+            app._task_editor = lambda: SimpleNamespace(text=" saved task ")  # type: ignore[method-assign]
+            calls = 0
+
+            def fail_if_saved(_: str) -> None:
+                nonlocal calls
+                calls += 1
+
+            app.save_task_text = fail_if_saved  # type: ignore[method-assign]
+
+            self.assertTrue(app._autosave_task_before_run())
+            self.assertEqual(calls, 0)
+
     def test_console_translation_keys_exist(self) -> None:
         console_path = Path(__file__).resolve().parents[1] / "agent_bridge" / "ui" / "console.py"
         console_source = console_path.read_text(encoding="utf-8")
@@ -142,15 +188,19 @@ class ConsoleTests(TestCase):
             self.assertIn(" out ", rendered.plain)
             self.assertIn("hello", rendered.plain)
 
-    def test_render_stream_line_styles_ansi_stderr_red(self) -> None:
+    def test_render_stream_line_treats_stderr_as_log_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             app = self._make_app(Path(tmp_dir))
 
             rendered = app._render_stream_line("Builder", "stderr", "\x1b[32mboom\x1b[0m")
 
-            self.assertIn(" err ", rendered.plain)
+            self.assertIn(" log ", rendered.plain)
             self.assertIn("boom", rendered.plain)
-            self.assertIn("red", {str(span.style) for span in rendered.spans})
+            self.assertNotIn("red", {str(span.style) for span in rendered.spans})
+
+    def test_stream_line_style_marks_only_error_words_red(self) -> None:
+        self.assertEqual(ConsoleApp._stream_line_style("stderr", "normal progress"), "white")
+        self.assertEqual(ConsoleApp._stream_line_style("stderr", "fatal failure"), "red")
 
     def test_format_usage_summary_formats_known_and_unknown_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
