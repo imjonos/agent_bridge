@@ -8,6 +8,7 @@ from unittest import TestCase
 
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.text import Text
 
 from agent_bridge.config import Settings
@@ -74,6 +75,7 @@ class ConsoleTests(TestCase):
     def test_run_binding_uses_f5_go(self) -> None:
         bindings = {binding.action: binding for binding in ConsoleApp.BINDINGS}
 
+        self.assertNotIn("save_task", bindings)
         self.assertEqual(bindings["run_next"].key, "f5")
         self.assertEqual(bindings["run_next"].description, "Go")
         self.assertEqual(bindings["stop_running"].key, "f6")
@@ -92,6 +94,7 @@ class ConsoleTests(TestCase):
             self.assertIn("F5 Go", first_row)
             self.assertIn("F6 Stop", first_row)
             self.assertIn("^Z Rollback", second_row)
+            self.assertIn("^S Save", first_row)
             self.assertNotIn("^U", first_row)
             self.assertNotIn("^H", second_row)
             self.assertNotIn("Timeline", second_row)
@@ -118,6 +121,38 @@ class ConsoleTests(TestCase):
             app.save_task_text = fail_if_saved  # type: ignore[method-assign]
 
             self.assertTrue(app._autosave_task_before_run())
+            self.assertEqual(calls, 0)
+
+    def test_exact_ctrl_s_key_saves_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            calls = 0
+
+            def save() -> None:
+                nonlocal calls
+                calls += 1
+
+            event = SimpleNamespace(key="ctrl+s", prevent_default=lambda: None, stop=lambda: None)
+            app.action_save_task = save  # type: ignore[method-assign]
+
+            app.on_key(event)  # type: ignore[arg-type]
+
+            self.assertEqual(calls, 1)
+
+    def test_ctrl_command_s_key_does_not_save_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            calls = 0
+
+            def save() -> None:
+                nonlocal calls
+                calls += 1
+
+            event = SimpleNamespace(key="ctrl+cmd+s", prevent_default=lambda: None, stop=lambda: None)
+            app.action_save_task = save  # type: ignore[method-assign]
+
+            app.on_key(event)  # type: ignore[arg-type]
+
             self.assertEqual(calls, 0)
 
     def test_console_translation_keys_exist(self) -> None:
@@ -201,6 +236,22 @@ class ConsoleTests(TestCase):
             self.assertNotIn("log", rendered.plain)
             self.assertNotIn("red", {str(span.style) for span in rendered.spans})
 
+    def test_render_stream_line_highlights_shell_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            rendered = app._render_stream_line("Builder", "stdout", "$ git diff --stat")
+
+            self.assertIsInstance(rendered, Syntax)
+
+    def test_render_stream_line_highlights_diff_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            rendered = app._render_stream_line("Builder", "stdout", "diff --git a/app.py b/app.py")
+
+            self.assertIsInstance(rendered, Syntax)
+
     def test_stream_line_style_marks_only_error_words_red(self) -> None:
         self.assertEqual(ConsoleApp._stream_line_style("stderr", "normal progress"), "white")
         self.assertEqual(ConsoleApp._stream_line_style("stderr", "fatal failure"), "red")
@@ -214,6 +265,14 @@ class ConsoleTests(TestCase):
 
             self.assertEqual(app._format_usage_summary(known), "2 runs / 3.5s / tokens 420")
             self.assertEqual(app._format_usage_summary(unknown), "1 runs / 0.2s / tokens n/a")
+
+    def test_running_status_badge_is_blue_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            badge = app._status_badge("running")
+
+            self.assertEqual(str(badge.style), "bold blue")
 
     def test_render_agent_chip_contains_usage_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

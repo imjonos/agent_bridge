@@ -16,6 +16,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
+from textual.events import Key
 from textual.widgets import Header, RichLog, Static, TextArea
 
 from ..config import Settings
@@ -132,7 +133,6 @@ class ConsoleApp(App[None], inherit_css=False):
     """
 
     BINDINGS = [
-        Binding("ctrl+s", "save_task", "Save task", show=True),
         Binding("ctrl+n", "new_task", "New task", show=False),
         Binding("f5", "run_next", "Go", show=False),
         Binding("f6", "stop_running", "Stop", show=False),
@@ -206,6 +206,13 @@ class ConsoleApp(App[None], inherit_css=False):
         self.set_interval(1.0, self._refresh_running_timer)
         self._refresh_ui()
         self._task_editor().focus()
+
+    def on_key(self, event: Key) -> None:
+        if event.key != "ctrl+s":
+            return
+        event.prevent_default()
+        event.stop()
+        self.action_save_task()
 
     def action_save_task(self) -> None:
         try:
@@ -836,7 +843,7 @@ class ConsoleApp(App[None], inherit_css=False):
     def _status_badge(self, status: str) -> Text:
         styles = {
             "waiting": "black on bright_white",
-            "running": "white on blue",
+            "running": "bold blue",
             "success": "black on green",
             "error": "white on red",
             "stopped": "black on bright_yellow",
@@ -864,12 +871,50 @@ class ConsoleApp(App[None], inherit_css=False):
             return "yellow"
         return "white"
 
-    def _render_stream_line(self, title: str, stream_name: str, line: str, style: str | None = None) -> Text:
+    def _render_stream_line(self, title: str, stream_name: str, line: str, style: str | None = None):
         style = style or self._stream_line_style(stream_name, line)
+        syntax = self._stream_line_syntax(line)
+        if syntax is not None:
+            return syntax
         content = Text.from_ansi(line.rstrip("\n"))
         if not content.spans:
             content.stylize(style)
         return content
+
+    @staticmethod
+    def _stream_line_syntax(line: str) -> Syntax | None:
+        stripped = line.rstrip("\n")
+        if not stripped.strip():
+            return None
+        if ConsoleApp._looks_like_diff_line(stripped):
+            return Syntax(stripped, "diff", background_color="default", word_wrap=True)
+        if ConsoleApp._looks_like_shell_command(stripped):
+            command = re.sub(r"^\s*(?:[$>]\s*|(?:command|cmd)\s*:\s*)", "", stripped, flags=re.IGNORECASE)
+            return Syntax(command, "bash", background_color="default", word_wrap=True)
+        if ConsoleApp._looks_like_json(stripped):
+            return Syntax(stripped, "json", background_color="default", word_wrap=True)
+        return None
+
+    @staticmethod
+    def _looks_like_diff_line(line: str) -> bool:
+        stripped = line.lstrip()
+        return (
+            stripped.startswith(("diff --git ", "index ", "@@ ", "+++ ", "--- "))
+            or (stripped.startswith(("+", "-")) and not stripped.startswith(("+++", "---")))
+        )
+
+    @staticmethod
+    def _looks_like_shell_command(line: str) -> bool:
+        stripped = line.strip()
+        return bool(
+            re.match(r"^(?:[$>]\s+|(?:command|cmd)\s*:\s*)\S+", stripped, re.IGNORECASE)
+            or re.match(r"^(?:npm|pnpm|yarn|python|python3|pytest|git|docker|cargo|go|php|composer)\s+\S+", stripped)
+        )
+
+    @staticmethod
+    def _looks_like_json(line: str) -> bool:
+        stripped = line.strip()
+        return (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]"))
 
     def _agent_engine_for_title(self, title: str) -> str:
         if title.startswith("Reviewer"):
