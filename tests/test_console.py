@@ -181,24 +181,24 @@ class ConsoleTests(TestCase):
 
         self.assertIsNone(ConsoleApp._extract_token_usage(text))
 
-    def test_render_stream_line_adds_rail_and_stdout_badge(self) -> None:
+    def test_render_stream_line_outputs_clean_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             app = self._make_app(Path(tmp_dir))
 
             rendered = app._render_stream_line("Builder", "stdout", "hello")
 
-            self.assertIn("│", rendered.plain)
-            self.assertIn(" out ", rendered.plain)
-            self.assertIn("hello", rendered.plain)
+            self.assertEqual(rendered.plain, "hello")
+            self.assertNotIn("Builder", rendered.plain)
+            self.assertNotIn("out", rendered.plain)
 
-    def test_render_stream_line_treats_stderr_as_log_stream(self) -> None:
+    def test_render_stream_line_does_not_label_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             app = self._make_app(Path(tmp_dir))
 
             rendered = app._render_stream_line("Builder", "stderr", "\x1b[32mboom\x1b[0m")
 
-            self.assertIn(" log ", rendered.plain)
-            self.assertIn("boom", rendered.plain)
+            self.assertEqual(rendered.plain, "boom")
+            self.assertNotIn("log", rendered.plain)
             self.assertNotIn("red", {str(span.style) for span in rendered.spans})
 
     def test_stream_line_style_marks_only_error_words_red(self) -> None:
@@ -225,7 +225,7 @@ class ConsoleTests(TestCase):
             self.assertIn("Builder", rendered.plain)
             self.assertIn("2 runs / 3.5s / tokens 420", rendered.plain)
 
-    def test_append_final_result_writes_markdown_and_stderr_panel(self) -> None:
+    def test_append_final_result_writes_only_agent_result_panel(self) -> None:
         class FakeLog:
             def __init__(self) -> None:
                 self.entries: list[object] = []
@@ -248,7 +248,6 @@ class ConsoleTests(TestCase):
             app._append_final_result("Builder", result, "error")
 
             panels = [entry for entry in log.entries if isinstance(entry, Panel)]
-            self.assertEqual(len(panels), 2)
+            self.assertEqual(len(panels), 1)
             self.assertIsInstance(panels[0].renderable, Markdown)
-            self.assertIsInstance(panels[1].renderable, Text)
-            self.assertIn("warning", panels[1].renderable.plain)
+            self.assertIn("Builder", str(panels[0].title))

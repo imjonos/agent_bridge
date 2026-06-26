@@ -563,6 +563,14 @@ class ConsoleApp(App[None], inherit_css=False):
         meta.add_row(Text(engine, style="grey70"), Text(f"rc {returncode_text} / {duration_text}", style="grey70"))
         return meta
 
+    @staticmethod
+    def _role_style(title: str) -> str:
+        if title.startswith("Reviewer"):
+            return "magenta"
+        if title.startswith("Builder"):
+            return "cyan"
+        return "blue"
+
     def _prepare_live_output(self, title: str) -> None:
         if not self._ui_ready:
             return
@@ -571,9 +579,9 @@ class ConsoleApp(App[None], inherit_css=False):
         log.clear()
         log.write(
             Panel(
-                self._render_agent_meta(title, self._agent_engine_for_title(title), None, "running"),
+                Text(f"{title} · {self._agent_engine_for_title(title)}", style=f"bold {self._role_style(title)}"),
                 title=self._t("prompt_and_process"),
-                border_style="yellow",
+                border_style=self._role_style(title),
                 padding=(0, 1),
             )
         )
@@ -582,28 +590,17 @@ class ConsoleApp(App[None], inherit_css=False):
     def _append_final_result(self, title: str, result, status: str) -> None:
         log = self._live_log()
         log.write(Text(""))
-        log.write(self._render_agent_meta(title, result.agent_name, result, status))
         stdout = result.text.strip()
-        stderr = result.stderr.strip()
-        border_style = "green" if status == "success" else "red"
+        border_style = self._role_style(title) if status == "success" else "red"
         result_body = Markdown(stdout or self._t("empty_output")) if stdout else Text(self._t("empty"), style="grey70")
         log.write(
             Panel(
                 result_body,
-                title=self._t("final_result_title"),
+                title=f"{title} · {self._t('final_result_title')}",
                 border_style=border_style,
                 padding=(0, 1),
             )
         )
-        if stderr:
-            log.write(
-                Panel(
-                    Text.from_ansi(stderr),
-                    title=self._t("command_result_stderr"),
-                    border_style="red",
-                    padding=(0, 1),
-                )
-            )
 
     def _append_live_output(self, title: str, stream_name: str, line: str) -> None:
         if not self._ui_ready or not line:
@@ -781,7 +778,7 @@ class ConsoleApp(App[None], inherit_css=False):
     def _status_badge(self, status: str) -> Text:
         styles = {
             "waiting": "black on bright_white",
-            "running": "black on yellow",
+            "running": "white on blue",
             "success": "black on green",
             "error": "white on red",
             "stopped": "black on bright_yellow",
@@ -795,7 +792,7 @@ class ConsoleApp(App[None], inherit_css=False):
     def _status_text_style(status: str) -> str:
         return {
             "waiting": "grey70",
-            "running": "yellow",
+            "running": "blue",
             "success": "green",
             "error": "red",
             "stopped": "yellow",
@@ -811,23 +808,10 @@ class ConsoleApp(App[None], inherit_css=False):
 
     def _render_stream_line(self, title: str, stream_name: str, line: str, style: str | None = None) -> Text:
         style = style or self._stream_line_style(stream_name, line)
-        is_error_stream = stream_name == "stderr"
-        badge = "log" if is_error_stream else "out"
-        badge_style = "black on yellow" if is_error_stream else "black on cyan"
-        rail_style = "red" if style == "red" else "yellow" if style == "yellow" else "cyan"
-
-        text = Text()
-        text.append("│ ", style=rail_style)
-        text.append(f"{title:<11}", style="grey70")
-        text.append(" ")
-        text.append(f" {badge} ", style=badge_style)
-        text.append(" ")
-
         content = Text.from_ansi(line.rstrip("\n"))
         if not content.spans:
             content.stylize(style)
-        text.append_text(content)
-        return text
+        return content
 
     def _agent_engine_for_title(self, title: str) -> str:
         if title.startswith("Reviewer"):
