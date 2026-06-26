@@ -5,6 +5,8 @@ import re
 from textwrap import shorten
 from typing import Callable
 
+from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -33,7 +35,7 @@ class ConsoleApp(App[None], inherit_css=False):
     }
 
     #status_bar {
-        height: 5;
+        height: 6;
         layout: horizontal;
         padding: 0 1;
     }
@@ -65,7 +67,7 @@ class ConsoleApp(App[None], inherit_css=False):
     }
 
     .stat-card {
-        height: 4;
+        height: 5;
         border: solid #30363d;
         background: #111820;
         color: #c9d1d9;
@@ -87,11 +89,7 @@ class ConsoleApp(App[None], inherit_css=False):
     }
 
     #task_panel {
-        height: 8;
-    }
-
-    #usage_panel {
-        height: 6;
+        height: 12;
     }
 
     #history_panel {
@@ -154,7 +152,6 @@ class ConsoleApp(App[None], inherit_css=False):
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
-        self._final_result_text = ""
         self._usage = {
             "builder": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
             "reviewer": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
@@ -179,16 +176,12 @@ class ConsoleApp(App[None], inherit_css=False):
                         tab_behavior="indent",
                         show_line_numbers=False,
                     )
-                with Container(id="usage_panel", classes="panel"):
-                    yield Static(Text(self._t("usage_title"), style="bold white"), id="usage_title")
-                    yield Static(id="usage_card")
                 with Container(id="history_panel", classes="panel"):
                     yield Static(Text(self._t("history_title"), style="bold white"), id="history_title")
                     yield RichLog(id="history_log", markup=True, wrap=True, auto_scroll=True)
             with Vertical(id="workspace"):
                 with Container(id="live_panel", classes="panel"):
                     yield Static(Text(self._t("live_output_title"), style="bold white"), id="live_title")
-                    yield Static(id="live_meta")
                     yield RichLog(id="live_log", markup=True, wrap=True, auto_scroll=True)
         with Container(id="menu_panel"):
             yield Static(
@@ -221,7 +214,6 @@ class ConsoleApp(App[None], inherit_css=False):
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
-        self._final_result_text = ""
         self._task_editor().clear()
         self._set_message(self._t("new_task_title"))
         self._append_activity(self._t("new_task_title"), self._t("new_task_activity"), style="cyan")
@@ -287,7 +279,6 @@ class ConsoleApp(App[None], inherit_css=False):
         self.workflow.set_task(text)
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
-        self._final_result_text = ""
         self._refresh_ui()
         self._refresh_history_log()
         self._append_activity(self._t("task_log_title"), f"{self._t('saved_task')}: {self._task_summary(text)}", style="green")
@@ -406,7 +397,6 @@ class ConsoleApp(App[None], inherit_css=False):
             return
         self._refresh_status_card()
         self._refresh_config_card()
-        self._refresh_usage_card()
         self._update_initial_result_widgets()
         self._refresh_history_log()
         self._set_task_editor(self.workflow.state.current_task or "")
@@ -416,21 +406,16 @@ class ConsoleApp(App[None], inherit_css=False):
             return
         self._status_card().update(self._render_status_card())
         self._builder_chip().update(
-            self._render_agent_chip("Builder", self.settings.builder_agent, self._builder_status)
+            self._render_agent_chip("Builder", self.settings.builder_agent, self._builder_status, self._usage["builder"])
         )
         self._reviewer_chip().update(
-            self._render_agent_chip("Reviewer", self.settings.reviewer_agent, self._reviewer_status)
+            self._render_agent_chip("Reviewer", self.settings.reviewer_agent, self._reviewer_status, self._usage["reviewer"])
         )
 
     def _refresh_config_card(self) -> None:
         if not self._ui_ready:
             return
         self._config_card().update(self._render_config_card())
-
-    def _refresh_usage_card(self) -> None:
-        if not self._ui_ready:
-            return
-        self._usage_card().update(self._render_usage_card())
 
     def _refresh_history_log(self) -> None:
         if not self._ui_ready:
@@ -445,8 +430,6 @@ class ConsoleApp(App[None], inherit_css=False):
             return
         result = self.workflow.state.last_reviewer_result or self.workflow.state.last_builder_result
         if result is None:
-            self._final_result_text = ""
-            self._live_meta().update(self._render_live_meta())
             return
         self._live_log().clear()
         title = "Reviewer" if result.role == "reviewer" else "Builder"
@@ -456,8 +439,6 @@ class ConsoleApp(App[None], inherit_css=False):
     def _update_final_result(self, title: str, result, status: str) -> None:
         if not self._ui_ready:
             return
-        self._final_result_text = result.text or result.stderr.strip() or self._t("empty_output")
-        self._live_meta().update(self._render_live_meta())
         self._append_final_result(title, result, status)
 
     def _render_status_card(self) -> Table:
@@ -479,43 +460,20 @@ class ConsoleApp(App[None], inherit_css=False):
         table.add_row(Text(self._t("config_language"), style="grey70"), Text(self._t(f"language_{self.language}"), style="white"))
         return table
 
-    def _render_usage_card(self) -> Table:
-        table = Table.grid(expand=True)
-        table.add_column(ratio=1, no_wrap=True)
-        table.add_column(ratio=2)
-        for role in ("builder", "reviewer"):
-            usage = self._usage[role]
-            tokens = str(usage["tokens"]) if usage["tokens_known"] else self._t("usage_tokens_unknown")
-            table.add_row(
-                Text(role, style="grey70"),
-                Text(
-                    self._t("usage_runs").format(
-                        runs=usage["runs"],
-                        duration=usage["duration"],
-                        tokens=tokens,
-                    ),
-                    style="white",
-                ),
-            )
-            table.add_row(
-                Text("", style="grey70"),
-                Text(self._t("usage_chars").format(stdout=usage["stdout"], stderr=usage["stderr"]), style="grey70"),
-            )
-        return table
-
-    def _render_live_meta(self) -> Table:
-        table = Table.grid(expand=True)
-        table.add_column(ratio=1, no_wrap=True)
-        table.add_column(ratio=3)
-        table.add_row(Text(self._t("live_output_title"), style="bold white"), Text(self._active_role, style="yellow"))
-        table.add_row(Text(self._t("live_meta_state"), style="grey70"), Text(self._last_message, style="white"))
-        return table
-
-    def _render_agent_chip(self, title: str, engine: str, status: str) -> Text:
+    def _render_agent_chip(self, title: str, engine: str, status: str, usage: dict[str, object]) -> Text:
         text = Text()
         text.append(f"{title}\n", style="bold white")
         text.append(self._status_label(status), style=self._status_text_style(status))
+        text.append(f"\n{self._format_usage_summary(usage)}", style="grey70")
         return text
+
+    def _format_usage_summary(self, usage: dict[str, object]) -> str:
+        tokens = str(usage["tokens"]) if usage["tokens_known"] else self._t("usage_tokens_unknown")
+        return self._t("usage_runs").format(
+            runs=usage["runs"],
+            duration=usage["duration"],
+            tokens=tokens,
+        )
 
     def _render_agent_meta(self, title: str, engine: str, result, status: str = "waiting") -> Table:
         returncode_text = "-"
@@ -538,29 +496,50 @@ class ConsoleApp(App[None], inherit_css=False):
         self._active_role = title
         log = self._live_log()
         log.clear()
-        log.write(Text(f"{title}: {self._t('prompt_and_process')}", style="yellow"))
-        self._live_meta().update(self._render_live_meta())
+        log.write(
+            Panel(
+                self._render_agent_meta(title, self._agent_engine_for_title(title), None, "running"),
+                title=self._t("prompt_and_process"),
+                border_style="yellow",
+                padding=(0, 1),
+            )
+        )
         self._append_activity(title, self._t("process_started"), style="yellow")
 
     def _append_final_result(self, title: str, result, status: str) -> None:
         log = self._live_log()
         log.write(Text(""))
         log.write(self._render_agent_meta(title, result.agent_name, result, status))
-        log.write(Text(self._t("final_result_title"), style="bold white"))
-        log.write(Text(self._final_result_text))
+        stdout = result.text.strip()
+        stderr = result.stderr.strip()
+        border_style = "green" if status == "success" else "red"
+        result_body = Markdown(stdout or self._t("empty_output")) if stdout else Text(self._t("empty"), style="grey70")
+        log.write(
+            Panel(
+                result_body,
+                title=self._t("final_result_title"),
+                border_style=border_style,
+                padding=(0, 1),
+            )
+        )
+        if stderr:
+            log.write(
+                Panel(
+                    Text.from_ansi(stderr),
+                    title=self._t("command_result_stderr"),
+                    border_style="red",
+                    padding=(0, 1),
+                )
+            )
 
     def _append_live_output(self, title: str, stream_name: str, line: str) -> None:
         if not self._ui_ready or not line:
             return
-        style = self._stream_line_style(stream_name, line)
-        prefix_style = "red" if stream_name == "stderr" else "cyan"
-        text = Text()
-        text.append(f"{title:<8} ", style="grey70")
-        text.append(f"{stream_name:<6} ", style=prefix_style)
-        text.append(line, style=style)
-        self._live_log().write(text)
-        if style == "red":
-            self._append_activity(title, self._short_text(line, 140), style="red")
+        for output_line in line.splitlines() or [line]:
+            style = self._stream_line_style(stream_name, output_line)
+            self._live_log().write(self._render_stream_line(title, stream_name, output_line, style))
+            if style == "red":
+                self._append_activity(title, self._short_text(output_line, 140), style="red")
 
     def _update_usage(self, role: str, result) -> None:
         usage = self._usage[role]
@@ -572,7 +551,7 @@ class ConsoleApp(App[None], inherit_css=False):
         if tokens is not None:
             usage["tokens"] += tokens
             usage["tokens_known"] = True
-        self._refresh_usage_card()
+        self._refresh_status_card()
 
     def _render_menu_text(self, commands: list[tuple[str, str]]) -> Text:
         text = Text()
@@ -648,14 +627,10 @@ class ConsoleApp(App[None], inherit_css=False):
             self._builder_status = "running"
             self.workflow.state.status = "running"
             self._active_role = "Builder"
-            if self._ui_ready:
-                self._live_meta().update(self._render_live_meta())
         elif action == "reviewer":
             self._reviewer_status = "running"
             self.workflow.state.status = "running"
             self._active_role = "Reviewer"
-            if self._ui_ready:
-                self._live_meta().update(self._render_live_meta())
         elif action == "tools":
             self.workflow.state.status = "running"
         self._set_message(self._t("run_started"))
@@ -665,14 +640,12 @@ class ConsoleApp(App[None], inherit_css=False):
         if not self._ui_ready:
             return
         self.query_one("#task_title", Static).update(Text(self._t("task_title"), style="bold white"))
-        self.query_one("#usage_title", Static).update(Text(self._t("usage_title"), style="bold white"))
         self.query_one("#history_title", Static).update(Text(self._t("history_title"), style="bold white"))
         self.query_one("#live_title", Static).update(Text(self._t("live_output_title"), style="bold white"))
         self.query_one("#menu_hint", Static).update(Text(self._t("commands_title"), style="bold white"))
         self.query_one("#menu_commands_1", Static).update(self._render_menu_text(self._menu_commands_first_row()))
         self.query_one("#menu_commands_2", Static).update(self._render_menu_text(self._menu_commands_second_row()))
         self._task_editor().placeholder = self._t("task_placeholder")
-        self._live_meta().update(self._render_live_meta())
 
     def _task_editor(self) -> TextArea:
         return self.query_one("#task_editor", TextArea)
@@ -688,12 +661,6 @@ class ConsoleApp(App[None], inherit_css=False):
 
     def _config_card(self) -> Static:
         return self.query_one("#config_card", Static)
-
-    def _usage_card(self) -> Static:
-        return self.query_one("#usage_card", Static)
-
-    def _live_meta(self) -> Static:
-        return self.query_one("#live_meta", Static)
 
     def _live_log(self) -> RichLog:
         return self.query_one("#live_log", RichLog)
@@ -738,6 +705,31 @@ class ConsoleApp(App[None], inherit_css=False):
             return "yellow"
         return "white"
 
+    def _render_stream_line(self, title: str, stream_name: str, line: str, style: str | None = None) -> Text:
+        style = style or self._stream_line_style(stream_name, line)
+        is_error_stream = stream_name == "stderr"
+        badge = "err" if is_error_stream else "out"
+        badge_style = "white on red" if is_error_stream else "black on cyan"
+        rail_style = "red" if style == "red" else "yellow" if style == "yellow" else "cyan"
+
+        text = Text()
+        text.append("│ ", style=rail_style)
+        text.append(f"{title:<11}", style="grey70")
+        text.append(" ")
+        text.append(f" {badge} ", style=badge_style)
+        text.append(" ")
+
+        content = Text.from_ansi(line.rstrip("\n"))
+        if is_error_stream or not content.spans:
+            content.stylize(style)
+        text.append_text(content)
+        return text
+
+    def _agent_engine_for_title(self, title: str) -> str:
+        if title.startswith("Reviewer"):
+            return self.settings.reviewer_agent
+        return self.settings.builder_agent
+
     def _should_apply_review_feedback(self) -> bool:
         if self.workflow.state.last_completed_role != "reviewer":
             return False
@@ -766,22 +758,44 @@ class ConsoleApp(App[None], inherit_css=False):
             if not (line.strip().startswith("{") and line.strip().endswith("}"))
         ]
         text_without_json = "\n".join(text_lines)
-
-        token_context = r"(?:total|used|usage|spent|consumed|input|prompt|output|completion)"
-        for match in re.finditer(
-            rf"\b{token_context}[\w\s.-]{{0,32}}(?:tokens?|tok)\D{{0,12}}([\d,]+)\b",
-            text_without_json,
-            re.IGNORECASE,
-        ):
-            totals.append(int(match.group(1).replace(",", "")))
-        for match in re.finditer(
-            rf"\b([\d,]+)\s+(?:tokens?|tok)\b[\w\s./-]{{0,32}}\b(?:{token_context})\b",
-            text_without_json,
-            re.IGNORECASE,
-        ):
-            totals.append(int(match.group(1).replace(",", "")))
+        totals.extend(cls._extract_text_token_usage(text_without_json))
 
         return sum(totals) if totals else None
+
+    @staticmethod
+    def _extract_text_token_usage(text: str) -> list[int]:
+        total_context = {"total", "used", "usage", "spent", "consumed"}
+        component_context = {"input", "prompt", "output", "completion"}
+        token_context = "|".join((*total_context, *component_context))
+        context_before_tokens = re.compile(
+            rf"\b(?P<context>{token_context})[\s:.-]{{0,16}}(?:tokens?|tok)\D{{0,12}}(?P<tokens>[\d,]+)\b",
+            re.IGNORECASE,
+        )
+        context_before_number = re.compile(
+            rf"\b(?P<context>{token_context})[\s:.-]{{0,16}}(?P<tokens>[\d,]+)\s*(?:tokens?|tok)\b",
+            re.IGNORECASE,
+        )
+        tokens_before_context = re.compile(
+            rf"\b(?P<tokens>[\d,]+)\s+(?:tokens?|tok)\b[\w\s./-]{{0,32}}\b(?P<context>{token_context})\b",
+            re.IGNORECASE,
+        )
+
+        total_values: list[int] = []
+        component_values: list[int] = []
+        for line in text.splitlines():
+            matches = [
+                (match.group("context").lower(), int(match.group("tokens").replace(",", "")))
+                for pattern in (context_before_tokens, context_before_number, tokens_before_context)
+                for match in pattern.finditer(line)
+            ]
+            for context, tokens in matches:
+                if context in total_context:
+                    total_values.append(tokens)
+                elif context in component_context:
+                    component_values.append(tokens)
+        if total_values:
+            return [max(total_values)]
+        return component_values
 
     @staticmethod
     def _extract_json_token_usage(text: str) -> list[int]:

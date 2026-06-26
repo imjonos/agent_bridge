@@ -3,7 +3,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 from unittest import TestCase
+
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
 
 from agent_bridge.config import Settings
 from agent_bridge.services.history import HistoryService
@@ -84,7 +89,113 @@ class ConsoleTests(TestCase):
 
         self.assertEqual(ConsoleApp._extract_token_usage(text), 2048)
 
+    def test_extract_token_usage_prefers_textual_total_over_breakdown(self) -> None:
+        text = "Token usage: total tokens: 300 input tokens: 120 output tokens: 180"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
+
+    def test_extract_token_usage_sums_textual_breakdown_without_total(self) -> None:
+        text = "Token usage: input tokens: 120 output tokens: 180"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
+
+    def test_extract_token_usage_reads_total_before_token_word(self) -> None:
+        text = "Total: 2,048 tokens"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 2048)
+
+    def test_extract_token_usage_prefers_total_across_lines(self) -> None:
+        text = "input tokens: 120\noutput tokens: 180\ntotal tokens: 300"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
+
+    def test_extract_token_usage_dedupes_repeated_total(self) -> None:
+        text = "total tokens: 300\ntotal tokens: 300"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
+
+    def test_update_usage_dedupes_total_repeated_in_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            result = SimpleNamespace(
+                stdout="total tokens: 300",
+                stderr="total tokens: 300",
+                duration_sec=1.0,
+            )
+
+            app._update_usage("builder", result)
+
+            self.assertEqual(app._usage["builder"]["tokens"], 300)
+
     def test_extract_token_usage_does_not_guess_from_output_length(self) -> None:
         text = "Normal agent output without usage metadata."
 
         self.assertIsNone(ConsoleApp._extract_token_usage(text))
+
+    def test_render_stream_line_adds_rail_and_stdout_badge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            rendered = app._render_stream_line("Builder", "stdout", "hello")
+
+            self.assertIn("│", rendered.plain)
+            self.assertIn(" out ", rendered.plain)
+            self.assertIn("hello", rendered.plain)
+
+    def test_render_stream_line_styles_ansi_stderr_red(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            rendered = app._render_stream_line("Builder", "stderr", "\x1b[32mboom\x1b[0m")
+
+            self.assertIn(" err ", rendered.plain)
+            self.assertIn("boom", rendered.plain)
+            self.assertIn("red", {str(span.style) for span in rendered.spans})
+
+    def test_format_usage_summary_formats_known_and_unknown_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            known = {"runs": 2, "duration": 3.5, "tokens": 420, "tokens_known": True}
+            unknown = {"runs": 1, "duration": 0.25, "tokens": 0, "tokens_known": False}
+
+            self.assertEqual(app._format_usage_summary(known), "2 runs / 3.5s / tokens 420")
+            self.assertEqual(app._format_usage_summary(unknown), "1 runs / 0.2s / tokens n/a")
+
+    def test_render_agent_chip_contains_usage_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            usage = {"runs": 2, "duration": 3.5, "tokens": 420, "tokens_known": True}
+
+            rendered = app._render_agent_chip("Builder", "codex", "success", usage)
+
+            self.assertIn("Builder", rendered.plain)
+            self.assertIn("2 runs / 3.5s / tokens 420", rendered.plain)
+
+    def test_append_final_result_writes_markdown_and_stderr_panel(self) -> None:
+        class FakeLog:
+            def __init__(self) -> None:
+                self.entries: list[object] = []
+
+            def write(self, value: object) -> None:
+                self.entries.append(value)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            log = FakeLog()
+            app._live_log = lambda: log  # type: ignore[method-assign]
+            result = SimpleNamespace(
+                agent_name="codex",
+                text="# Done",
+                stderr="\x1b[31mwarning\x1b[0m",
+                returncode=1,
+                duration_sec=1.25,
+            )
+
+            app._append_final_result("Builder", result, "error")
+
+            panels = [entry for entry in log.entries if isinstance(entry, Panel)]
+            self.assertEqual(len(panels), 2)
+            self.assertIsInstance(panels[0].renderable, Markdown)
+            self.assertIsInstance(panels[1].renderable, Text)
+            self.assertIn("warning", panels[1].renderable.plain)
