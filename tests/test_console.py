@@ -75,7 +75,8 @@ class ConsoleTests(TestCase):
     def test_run_binding_uses_f5_go(self) -> None:
         bindings = {binding.action: binding for binding in ConsoleApp.BINDINGS}
 
-        self.assertNotIn("save_task", bindings)
+        self.assertEqual(bindings["save_task"].key, "f2")
+        self.assertEqual(bindings["save_task"].description, "Save")
         self.assertEqual(bindings["run_next"].key, "f5")
         self.assertEqual(bindings["run_next"].description, "Go")
         self.assertEqual(bindings["stop_running"].key, "f6")
@@ -94,7 +95,8 @@ class ConsoleTests(TestCase):
             self.assertIn("F5 Go", first_row)
             self.assertIn("F6 Stop", first_row)
             self.assertIn("^Z Rollback", second_row)
-            self.assertIn("^S Save", first_row)
+            self.assertIn("F2 Save", first_row)
+            self.assertNotIn("^S", first_row)
             self.assertNotIn("^U", first_row)
             self.assertNotIn("^H", second_row)
             self.assertNotIn("Timeline", second_row)
@@ -123,37 +125,10 @@ class ConsoleTests(TestCase):
             self.assertTrue(app._autosave_task_before_run())
             self.assertEqual(calls, 0)
 
-    def test_exact_ctrl_s_key_saves_task(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            app = self._make_app(Path(tmp_dir))
-            calls = 0
+    def test_ctrl_s_is_not_registered_as_save_shortcut(self) -> None:
+        keys = {binding.key for binding in ConsoleApp.BINDINGS}
 
-            def save() -> None:
-                nonlocal calls
-                calls += 1
-
-            event = SimpleNamespace(key="ctrl+s", prevent_default=lambda: None, stop=lambda: None)
-            app.action_save_task = save  # type: ignore[method-assign]
-
-            app.on_key(event)  # type: ignore[arg-type]
-
-            self.assertEqual(calls, 1)
-
-    def test_ctrl_command_s_key_does_not_save_task(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            app = self._make_app(Path(tmp_dir))
-            calls = 0
-
-            def save() -> None:
-                nonlocal calls
-                calls += 1
-
-            event = SimpleNamespace(key="ctrl+cmd+s", prevent_default=lambda: None, stop=lambda: None)
-            app.action_save_task = save  # type: ignore[method-assign]
-
-            app.on_key(event)  # type: ignore[arg-type]
-
-            self.assertEqual(calls, 0)
+        self.assertNotIn("ctrl+s", keys)
 
     def test_console_translation_keys_exist(self) -> None:
         console_path = Path(__file__).resolve().parents[1] / "agent_bridge" / "ui" / "console.py"

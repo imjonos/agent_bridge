@@ -16,7 +16,6 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.events import Key
 from textual.widgets import Header, RichLog, Static, TextArea
 
 from ..config import Settings
@@ -133,6 +132,7 @@ class ConsoleApp(App[None], inherit_css=False):
     """
 
     BINDINGS = [
+        Binding("f2", "save_task", "Save", show=True),
         Binding("ctrl+n", "new_task", "New task", show=False),
         Binding("f5", "run_next", "Go", show=False),
         Binding("f6", "stop_running", "Stop", show=False),
@@ -206,13 +206,6 @@ class ConsoleApp(App[None], inherit_css=False):
         self.set_interval(1.0, self._refresh_running_timer)
         self._refresh_ui()
         self._task_editor().focus()
-
-    def on_key(self, event: Key) -> None:
-        if event.key != "ctrl+s":
-            return
-        event.prevent_default()
-        event.stop()
-        self.action_save_task()
 
     def action_save_task(self) -> None:
         try:
@@ -661,7 +654,7 @@ class ConsoleApp(App[None], inherit_css=False):
 
     def _menu_commands_first_row(self) -> list[tuple[str, str]]:
         return [
-            ("^S", self._t("save")),
+            ("F2", self._t("save")),
             ("^N", self._t("new")),
             ("F5", self._t("command_go")),
             ("F6", self._t("command_stop")),
