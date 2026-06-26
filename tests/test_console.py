@@ -241,13 +241,13 @@ class ConsoleTests(TestCase):
             self.assertEqual(app._format_usage_summary(known), "2 runs / 3.5s / tokens 420")
             self.assertEqual(app._format_usage_summary(unknown), "1 runs / 0.2s / tokens n/a")
 
-    def test_running_status_badge_is_blue_text(self) -> None:
+    def test_running_status_badge_has_blue_background(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             app = self._make_app(Path(tmp_dir))
 
             badge = app._status_badge("running")
 
-            self.assertEqual(str(badge.style), "bold blue")
+            self.assertEqual(str(badge.style), "white on blue")
 
     def test_render_agent_chip_contains_usage_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

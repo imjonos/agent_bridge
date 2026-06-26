@@ -836,7 +836,7 @@ class ConsoleApp(App[None], inherit_css=False):
     def _status_badge(self, status: str) -> Text:
         styles = {
             "waiting": "black on bright_white",
-            "running": "bold blue",
+            "running": "white on blue",
             "success": "black on green",
             "error": "white on red",
             "stopped": "black on bright_yellow",
