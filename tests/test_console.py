@@ -225,6 +225,36 @@ class ConsoleTests(TestCase):
             self.assertIn("Builder", rendered.plain)
             self.assertIn("2 runs / 3.5s / tokens 420", rendered.plain)
 
+    def test_active_run_summary_contains_role_engine_start_and_elapsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            app._set_running_state("builder")
+            summary = app._active_run_summary()
+
+            self.assertIn("Builder (codex)", summary)
+            self.assertRegex(summary, r"from \d{2}:\d{2}:\d{2} / \d{2}:\d{2}")
+
+    def test_active_run_summary_is_empty_when_not_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            app._set_running_state("reviewer")
+            app.workflow.state.status = "success"
+
+            self.assertEqual(app._active_run_summary(), "not set")
+
+    def test_active_run_summary_uses_explicit_tool_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+
+            app._set_running_state("tools", active_title="Git diff")
+
+            self.assertIn("Git diff", app._active_run_summary())
+
+    def test_format_elapsed_uses_minutes_or_hours(self) -> None:
+        self.assertEqual(ConsoleApp._format_elapsed(65), "01:05")
+        self.assertEqual(ConsoleApp._format_elapsed(3661), "1:01:01")
+
     def test_append_final_result_writes_only_agent_result_panel(self) -> None:
         class FakeLog:
             def __init__(self) -> None:

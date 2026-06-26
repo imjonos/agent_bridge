@@ -12,6 +12,8 @@ TRANSLATIONS: dict[Language, dict[str, str]] = {
     "en": {
         "activity_cleared": "Activity log cleared",
         "activity_title": "Activity",
+        "active_run": "Running",
+        "active_run_summary": "{name} from {started} / {elapsed}",
         "app_subtitle": "Builder -> Reviewer workflow",
         "app_title": "Agent Bridge",
         "builder_done": "Builder completed",
@@ -88,6 +90,8 @@ TRANSLATIONS: dict[Language, dict[str, str]] = {
     "ru": {
         "activity_cleared": "Журнал очищен",
         "activity_title": "Активность",
+        "active_run": "Запущен",
+        "active_run_summary": "{name} с {started} / {elapsed}",
         "app_subtitle": "Рабочий процесс Builder -> Reviewer",
         "app_title": "Agent Bridge",
         "builder_done": "Builder завершён",

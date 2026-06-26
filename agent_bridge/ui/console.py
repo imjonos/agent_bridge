@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from datetime import datetime
 from textwrap import shorten
 from typing import Callable
 
@@ -37,7 +39,7 @@ class ConsoleApp(App[None], inherit_css=False):
     }
 
     #status_bar {
-        height: 6;
+        height: 7;
         layout: horizontal;
         padding: 0 1;
     }
@@ -69,7 +71,7 @@ class ConsoleApp(App[None], inherit_css=False):
     }
 
     .stat-card {
-        height: 5;
+        height: 6;
         border: solid #30363d;
         background: #111820;
         color: #c9d1d9;
@@ -155,6 +157,8 @@ class ConsoleApp(App[None], inherit_css=False):
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
+        self._active_started_at: datetime | None = None
+        self._active_started_monotonic: float | None = None
         self._stop_requested = False
         self._usage = {
             "builder": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
@@ -199,6 +203,7 @@ class ConsoleApp(App[None], inherit_css=False):
         self.title = self._t("app_title")
         self.sub_title = self._t("app_subtitle")
         self._ui_ready = True
+        self.set_interval(1.0, self._refresh_running_timer)
         self._refresh_ui()
         self._task_editor().focus()
 
@@ -218,6 +223,7 @@ class ConsoleApp(App[None], inherit_css=False):
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
+        self._clear_active_run()
         self._task_editor().clear()
         self._set_message(self._t("new_task_title"))
         self._append_activity(self._t("new_task_title"), self._t("new_task_activity"), style="cyan")
@@ -238,7 +244,7 @@ class ConsoleApp(App[None], inherit_css=False):
             self._start_worker("reviewer", self._reviewer_worker, self._set_message)
             return
         if next_action == "builder_fix":
-            self._start_worker("builder_fix", self._fix_worker, self._set_message)
+            self._start_worker("builder_fix", self._fix_worker, self._set_message, active_title="Builder fix")
             return
         if next_action == "done":
             self._set_message(self._t("run_queue_done"))
@@ -250,7 +256,7 @@ class ConsoleApp(App[None], inherit_css=False):
         if not self._autosave_task_before_run():
             return
         if self._should_apply_review_feedback():
-            self._start_worker("builder_fix", self._fix_worker, self._set_message)
+            self._start_worker("builder_fix", self._fix_worker, self._set_message, active_title="Builder fix")
             return
         self._start_worker("builder", self._builder_worker, self._set_message)
 
@@ -269,21 +275,22 @@ class ConsoleApp(App[None], inherit_css=False):
             self._reviewer_status = "stopped"
         elif self._active_role.startswith("Builder"):
             self._builder_status = "stopped"
+        self._clear_active_run()
         self._set_message(self._t("stop_requested"))
         self._append_activity(self._t("command_stop"), self._t("stop_requested"), style="yellow")
         self._refresh_status_card()
 
     def action_show_diff(self) -> None:
         self._stop_requested = False
-        self._start_worker("tools", self._git_diff_worker, self._set_message)
+        self._start_worker("tools", self._git_diff_worker, self._set_message, active_title="Git diff")
 
     def action_run_tests(self) -> None:
         self._stop_requested = False
-        self._start_worker("tools", self._tests_worker, self._set_message)
+        self._start_worker("tools", self._tests_worker, self._set_message, active_title=self._t("tests_title"))
 
     def action_rollback_changes(self) -> None:
         self._stop_requested = False
-        self._start_worker("tools", self._rollback_worker, self._set_message)
+        self._start_worker("tools", self._rollback_worker, self._set_message, active_title=self._t("rollback_title"))
 
     def action_show_history(self) -> None:
         self._refresh_history_log()
@@ -327,9 +334,15 @@ class ConsoleApp(App[None], inherit_css=False):
             return False
         return True
 
-    def _start_worker(self, group: str, worker: Callable[[], None], status_message: Callable[[str], None]) -> None:
+    def _start_worker(
+        self,
+        group: str,
+        worker: Callable[[], None],
+        status_message: Callable[[str], None],
+        active_title: str | None = None,
+    ) -> None:
         status_message(self._t("run_started"))
-        self._set_running_state(group)
+        self._set_running_state(group, active_title=active_title)
         self.run_worker(worker, name=group, group=group, exclusive=group.startswith("builder") or group == "reviewer", thread=True, exit_on_error=False)
 
     def _builder_worker(self) -> None:
@@ -396,6 +409,7 @@ class ConsoleApp(App[None], inherit_css=False):
         if self._handle_stopped_result(title):
             return
         self._builder_status = "success" if result.returncode == 0 else "error"
+        self._clear_active_run()
         self._set_message(self._t("builder_done"))
         self._update_usage("builder", result)
         self._refresh_history_log()
@@ -407,6 +421,7 @@ class ConsoleApp(App[None], inherit_css=False):
         if self._handle_stopped_result("Reviewer"):
             return
         self._reviewer_status = "success" if result.returncode == 0 else "error"
+        self._clear_active_run()
         self._set_message(self._t("reviewer_done"))
         self._update_usage("reviewer", result)
         self._refresh_history_log()
@@ -416,6 +431,7 @@ class ConsoleApp(App[None], inherit_css=False):
 
     def _handle_diff_result(self, diff: str) -> None:
         self.workflow.state.status = "success"
+        self._clear_active_run()
         self._set_message(self._t("diff_ready"))
         self._activity_log().write(Text("Git diff", style="bold magenta"))
         self._activity_log().write(Syntax(diff or self._t("empty"), "diff", word_wrap=False))
@@ -426,6 +442,7 @@ class ConsoleApp(App[None], inherit_css=False):
         if self._handle_stopped_result(self._t("tests_title")):
             return
         self.workflow.state.status = "success" if result.returncode == 0 else "error"
+        self._clear_active_run()
         self._set_message(self._t("tests_done"))
         self.workflow.history.append(
             "test_result",
@@ -446,6 +463,7 @@ class ConsoleApp(App[None], inherit_css=False):
         if self._handle_stopped_result(self._t("rollback_title")):
             return
         self.workflow.state.status = "success"
+        self._clear_active_run()
         self._set_message(self._t("rollback_done").format(count=result.changed_count))
         self._activity_log().write(Text(self._t("rollback_title"), style="bold yellow"))
         self._activity_log().write(self._render_rollback_result(result))
@@ -459,6 +477,7 @@ class ConsoleApp(App[None], inherit_css=False):
             self._builder_status = "error"
         elif title == "Reviewer":
             self._reviewer_status = "error"
+        self._clear_active_run()
         self._append_activity(title, message, style="red")
         self._set_error(f"{title}: {message}")
         self._refresh_status_card()
@@ -519,6 +538,7 @@ class ConsoleApp(App[None], inherit_css=False):
         table.add_column(ratio=1, no_wrap=True)
         table.add_column(ratio=2)
         table.add_row(Text(self._t("status"), style="grey70"), self._status_badge(self.workflow.state.status))
+        table.add_row(Text(self._t("active_run"), style="grey70"), Text(self._active_run_summary(), style="white"))
         table.add_row(Text(self._t("project"), style="grey70"), Text(self._short_path(self.settings.project_dir), style="white"))
         table.add_row(Text(self._t("message"), style="grey70"), Text(self._short_text(self._last_message, 64), style="white"))
         return table
@@ -699,18 +719,18 @@ class ConsoleApp(App[None], inherit_css=False):
         self._last_message = message
         self._refresh_status_card()
 
-    def _set_running_state(self, action: str) -> None:
+    def _set_running_state(self, action: str, active_title: str | None = None) -> None:
         if action.startswith("builder"):
             self._builder_status = "running"
             self.workflow.state.status = "running"
-            self._active_role = "Builder"
+            self._set_active_run(active_title or "Builder")
         elif action == "reviewer":
             self._reviewer_status = "running"
             self.workflow.state.status = "running"
-            self._active_role = "Reviewer"
+            self._set_active_run(active_title or "Reviewer")
         elif action == "tools":
             self.workflow.state.status = "running"
-            self._active_role = self._t("tests_title")
+            self._set_active_run(active_title or self._t("command_run"))
         self._set_message(self._t("run_started"))
         self._refresh_status_card()
 
@@ -723,10 +743,48 @@ class ConsoleApp(App[None], inherit_css=False):
         elif title == "Reviewer":
             self._reviewer_status = "stopped"
         self._stop_requested = False
+        self._clear_active_run()
         self._set_message(self._t("run_stopped"))
         self._append_activity(title, self._t("run_stopped"), style="yellow")
         self._refresh_status_card()
         return True
+
+    def _set_active_run(self, role: str) -> None:
+        self._active_role = role
+        self._active_started_at = datetime.now()
+        self._active_started_monotonic = time.monotonic()
+
+    def _clear_active_run(self) -> None:
+        self._active_started_at = None
+        self._active_started_monotonic = None
+        self._active_role = "-"
+
+    def _refresh_running_timer(self) -> None:
+        if self.workflow.state.status == "running" and self._active_started_monotonic is not None:
+            self._refresh_status_card()
+
+    def _active_run_summary(self) -> str:
+        if self.workflow.state.status != "running" or self._active_started_at is None:
+            return self._t("not_set")
+        engine = self._agent_engine_for_title(self._active_role) if self._active_role.startswith(("Builder", "Reviewer")) else ""
+        name = f"{self._active_role} ({engine})" if engine else self._active_role
+        started = self._active_started_at.strftime("%H:%M:%S")
+        elapsed = self._format_elapsed(self._active_elapsed_sec())
+        return self._t("active_run_summary").format(name=name, started=started, elapsed=elapsed)
+
+    def _active_elapsed_sec(self) -> float:
+        if self._active_started_monotonic is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._active_started_monotonic)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total_seconds = int(seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _refresh_translated_text(self) -> None:
         if not self._ui_ready:
