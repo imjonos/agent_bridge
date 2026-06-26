@@ -17,6 +17,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Header, RichLog, Static, TextArea
 
 from ..config import Settings
+from ..services.rollback import RollbackError
 from ..services.git_context import get_git_diff
 from ..services.history import HistoryService
 from ..services.runner import run_shell_command, terminate_active_processes
@@ -136,6 +137,7 @@ class ConsoleApp(App[None], inherit_css=False):
         Binding("ctrl+b", "run_build", "Build", show=False),
         Binding("ctrl+r", "run_review", "Review", show=False),
         Binding("ctrl+d", "show_diff", "Diff", show=False),
+        Binding("ctrl+z", "rollback_changes", "Rollback", show=False),
         Binding("ctrl+t", "run_tests", "Tests", show=False),
         Binding("ctrl+l", "clear_activity", "Clear", show=False),
         Binding("ctrl+g", "toggle_language", "Language", show=True),
@@ -279,6 +281,10 @@ class ConsoleApp(App[None], inherit_css=False):
         self._stop_requested = False
         self._start_worker("tools", self._tests_worker, self._set_message)
 
+    def action_rollback_changes(self) -> None:
+        self._stop_requested = False
+        self._start_worker("tools", self._rollback_worker, self._set_message)
+
     def action_show_history(self) -> None:
         self._refresh_history_log()
         self._append_activity(self._t("history_title"), self._t("history_refreshed"), style="magenta")
@@ -374,6 +380,17 @@ class ConsoleApp(App[None], inherit_css=False):
         result = run_shell_command(self.settings.test_command, cwd=self.settings.project_dir, timeout=self.settings.agent_timeout)
         self.call_from_thread(self._handle_tests_result, result)
 
+    def _rollback_worker(self) -> None:
+        try:
+            result = self.workflow.rollback_last_changes()
+        except (RollbackError, WorkflowError) as exc:
+            self.call_from_thread(self._handle_worker_error, self._t("rollback_title"), exc)
+            return
+        except Exception as exc:
+            self.call_from_thread(self._handle_worker_error, self._t("rollback_title"), exc)
+            return
+        self.call_from_thread(self._handle_rollback_result, result)
+
     def _handle_builder_result(self, result, is_fix: bool = False) -> None:
         title = "Builder fix" if is_fix else "Builder"
         if self._handle_stopped_result(title):
@@ -422,6 +439,16 @@ class ConsoleApp(App[None], inherit_css=False):
         )
         self._activity_log().write(Text(self._t("tests_title"), style="bold yellow"))
         self._activity_log().write(self._render_command_result(result.command, result.stdout, result.stderr, result.returncode))
+        self._refresh_history_log()
+        self._refresh_status_card()
+
+    def _handle_rollback_result(self, result) -> None:
+        if self._handle_stopped_result(self._t("rollback_title")):
+            return
+        self.workflow.state.status = "success"
+        self._set_message(self._t("rollback_done").format(count=result.changed_count))
+        self._activity_log().write(Text(self._t("rollback_title"), style="bold yellow"))
+        self._activity_log().write(self._render_rollback_result(result))
         self._refresh_history_log()
         self._refresh_status_card()
 
@@ -621,6 +648,7 @@ class ConsoleApp(App[None], inherit_css=False):
     def _menu_commands_second_row(self) -> list[tuple[str, str]]:
         return [
             ("^D", self._t("command_diff")),
+            ("^Z", self._t("command_rollback")),
             ("^T", self._t("command_tests")),
             ("^L", self._t("clear")),
             ("^G", self._t("config_language")),
@@ -637,6 +665,9 @@ class ConsoleApp(App[None], inherit_css=False):
             "reviewer_result": "green",
             "fix_result": "green",
             "test_result": "yellow",
+            "rollback_snapshot": "dim",
+            "rollback_snapshot_error": "red",
+            "rollback_result": "yellow",
             "approved": "green",
             "error": "red",
         }.get(event_type, "white")
@@ -646,6 +677,9 @@ class ConsoleApp(App[None], inherit_css=False):
             "reviewer_result": "review",
             "fix_result": "fix",
             "test_result": "test",
+            "rollback_snapshot": "snap",
+            "rollback_snapshot_error": "snaperr",
+            "rollback_result": "undo",
             "approved": "ok",
             "error": "error",
         }.get(event_type, event_type)
@@ -921,6 +955,15 @@ class ConsoleApp(App[None], inherit_css=False):
         if stderr.strip():
             text.append(f"{self._t('command_result_stderr')}:\n{stderr.strip()}\n", style="red")
         text.append(f"{self._t('command_result_command')}: {command}", style="dim")
+        return text
+
+    def _render_rollback_result(self, result) -> Text:
+        text = Text()
+        text.append(f"{self._t('rollback_changed_count')}: {result.changed_count}\n", style="bold")
+        text.append(f"{self._t('rollback_restored')}: {', '.join(result.restored) or self._t('empty')}\n", style="white")
+        text.append(f"{self._t('rollback_reverted')}: {', '.join(result.reverted) or self._t('empty')}\n", style="white")
+        text.append(f"{self._t('rollback_removed')}: {', '.join(result.removed) or self._t('empty')}\n", style="white")
+        text.append(f"snapshot: {result.snapshot_id}", style="dim")
         return text
 
     @staticmethod

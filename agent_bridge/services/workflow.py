@@ -6,6 +6,7 @@ from ..config import Settings
 from ..prompts.templates import build_builder_prompt, build_fix_prompt, build_reviewer_prompt
 from .git_context import get_git_diff, get_git_status
 from .history import HistoryService
+from .rollback import RollbackError, RollbackResult, create_rollback_snapshot, rollback_last_snapshot
 
 
 @dataclass(slots=True)
@@ -34,6 +35,10 @@ class Workflow:
         self.reviewer = reviewer
         self.history = history
         self.state = WorkflowState()
+
+    @property
+    def rollback_dir(self):
+        return self.settings.project_path() / ".agent-bridge" / "rollback"
 
     def set_task(self, text: str) -> None:
         task = text.strip()
@@ -66,6 +71,7 @@ class Workflow:
             event_type = "builder_result"
 
         self.state.status = "running"
+        self._create_rollback_snapshot(event_type)
         result = self.builder.run(prompt, stream_callback=stream_callback)
         self.state.last_builder_result = result
         self.state.last_completed_role = "builder"
@@ -88,6 +94,7 @@ class Workflow:
             git_diff=get_git_diff(self.settings.project_dir),
         )
         self.state.status = "running"
+        self._create_rollback_snapshot("reviewer_result")
         result = self.reviewer.run(prompt, stream_callback=stream_callback)
         self.state.last_reviewer_result = result
         self.state.last_completed_role = "reviewer"
@@ -106,6 +113,21 @@ class Workflow:
         self.state.status = "approved"
         self.history.append("approved", {"task": self.state.current_task})
 
+    def rollback_last_changes(self) -> RollbackResult:
+        result = rollback_last_snapshot(self.settings.project_dir, self.rollback_dir)
+        self.state.status = "success"
+        self.history.append(
+            "rollback_result",
+            {
+                "snapshot_id": result.snapshot_id,
+                "restored": result.restored,
+                "removed": result.removed,
+                "reverted": result.reverted,
+                "changed_count": result.changed_count,
+            },
+        )
+        return result
+
     def show_history(self) -> list[dict[str, object]]:
         return self.history.read_current_session()
 
@@ -113,6 +135,12 @@ class Workflow:
         if not self.state.current_task:
             raise WorkflowError("Сначала введите задачу")
         return self.state.current_task
+
+    def _create_rollback_snapshot(self, _event_type: str) -> None:
+        try:
+            create_rollback_snapshot(self.settings.project_dir, self.rollback_dir)
+        except RollbackError:
+            return
 
     @staticmethod
     def _result_payload(result: AgentResult) -> dict[str, object]:

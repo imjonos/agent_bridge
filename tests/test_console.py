@@ -78,6 +78,8 @@ class ConsoleTests(TestCase):
         self.assertEqual(bindings["run_next"].description, "Go")
         self.assertEqual(bindings["stop_running"].key, "f6")
         self.assertEqual(bindings["stop_running"].description, "Stop")
+        self.assertEqual(bindings["rollback_changes"].key, "ctrl+z")
+        self.assertEqual(bindings["rollback_changes"].description, "Rollback")
         self.assertNotIn("show_history", bindings)
 
     def test_menu_shows_f5_go_and_hides_timeline_command(self) -> None:
@@ -89,6 +91,7 @@ class ConsoleTests(TestCase):
 
             self.assertIn("F5 Go", first_row)
             self.assertIn("F6 Stop", first_row)
+            self.assertIn("^Z Rollback", second_row)
             self.assertNotIn("^U", first_row)
             self.assertNotIn("^H", second_row)
             self.assertNotIn("Timeline", second_row)
