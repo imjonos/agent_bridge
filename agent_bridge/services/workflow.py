@@ -35,6 +35,7 @@ class Workflow:
         self.reviewer = reviewer
         self.history = history
         self.state = WorkflowState()
+        self.load_last_saved_task()
 
     @property
     def rollback_dir(self):
@@ -44,12 +45,47 @@ class Workflow:
         task = text.strip()
         if not task:
             raise WorkflowError("Нельзя установить пустую задачу")
+        if task == self.state.current_task:
+            return
         self.state.current_task = task
         self.state.last_builder_result = None
         self.state.last_reviewer_result = None
         self.state.last_completed_role = None
         self.state.status = "waiting"
         self.history.append("task_created", {"task": task})
+
+    def load_last_saved_task(self) -> bool:
+        records = self.history.read_last_workspace_records()
+        if not records:
+            return False
+        task = records[0].get("task")
+        if not isinstance(task, str) or not task.strip():
+            return False
+        self.state.current_task = task
+        self.state.last_builder_result = None
+        self.state.last_reviewer_result = None
+        self.state.last_completed_role = None
+        self.state.status = "waiting"
+        for record in records[1:]:
+            event_type = record.get("type")
+            if event_type in {"builder_result", "fix_result"}:
+                self.state.last_builder_result = self._result_from_record(record, default_role="builder")
+                self.state.last_completed_role = "builder"
+                self.state.status = "success" if self.state.last_builder_result.returncode == 0 else "error"
+            elif event_type == "reviewer_result":
+                self.state.last_reviewer_result = self._result_from_record(record, default_role="reviewer")
+                self.state.last_completed_role = "reviewer"
+                if self.state.last_reviewer_result.returncode != 0:
+                    self.state.status = "error"
+                elif self.state.last_reviewer_result.text.strip().upper() == "OK":
+                    self.state.status = "approved"
+                else:
+                    self.state.status = "success"
+            elif event_type == "approved":
+                self.state.status = "approved"
+            elif event_type == "error":
+                self.state.status = "error"
+        return True
 
     def run_builder(
         self,
@@ -144,7 +180,7 @@ class Workflow:
 
     @staticmethod
     def _result_payload(result: AgentResult) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "agent": result.agent_name,
             "role": result.role,
             "prompt": result.prompt,
@@ -153,3 +189,21 @@ class Workflow:
             "returncode": result.returncode,
             "duration_sec": result.duration_sec,
         }
+        tokens = getattr(result, "tokens", None)
+        if isinstance(tokens, int):
+            payload["tokens"] = tokens
+        return payload
+
+    @staticmethod
+    def _result_from_record(record: dict[str, object], default_role: str) -> AgentResult:
+        returncode_raw = record.get("returncode")
+        returncode = int(returncode_raw) if isinstance(returncode_raw, (int, float)) else 0
+        return AgentResult(
+            agent_name=str(record.get("agent") or ""),
+            role=str(record.get("role") or default_role),
+            prompt=str(record.get("prompt") or ""),
+            stdout=str(record.get("stdout") or ""),
+            stderr=str(record.get("stderr") or ""),
+            returncode=returncode,
+            duration_sec=float(record.get("duration_sec") or 0.0),
+        )

@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime
 from textwrap import shorten
+from types import SimpleNamespace
 from typing import Callable
 
 from rich.markdown import Markdown
@@ -22,9 +23,12 @@ from ..config import Settings
 from ..services.rollback import RollbackError
 from ..services.git_context import get_git_diff
 from ..services.history import HistoryService
-from ..services.runner import run_shell_command, terminate_active_processes
+from ..services.runner import run_process, run_shell_command, terminate_active_processes
 from ..services.workflow import Workflow, WorkflowError
 from .translations import DEFAULT_LANGUAGE, Language, SUPPORTED_LANGUAGES, translate
+
+
+CODEX_STATUS_TIMEOUT_SEC = 10
 
 
 class ConsoleApp(App[None], inherit_css=False):
@@ -164,6 +168,8 @@ class ConsoleApp(App[None], inherit_css=False):
             "builder": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
             "reviewer": {"runs": 0, "duration": 0.0, "stdout": 0, "stderr": 0, "tokens": 0, "tokens_known": False},
         }
+        self._restore_usage_from_history()
+        self._restore_agent_statuses()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -220,6 +226,7 @@ class ConsoleApp(App[None], inherit_css=False):
         self.workflow.state.last_reviewer_result = None
         self.workflow.state.last_completed_role = None
         self.workflow.state.status = "waiting"
+        self.workflow.history.append("task_cleared")
         self._builder_status = "waiting"
         self._reviewer_status = "waiting"
         self._active_role = "-"
@@ -352,7 +359,7 @@ class ConsoleApp(App[None], inherit_css=False):
         except Exception as exc:
             self.call_from_thread(self._handle_worker_error, "Builder", exc)
             return
-        self.call_from_thread(self._handle_builder_result, result)
+        self.call_from_thread(self._handle_builder_result, result, False)
 
     def _reviewer_worker(self) -> None:
         try:
@@ -404,30 +411,32 @@ class ConsoleApp(App[None], inherit_css=False):
             return
         self.call_from_thread(self._handle_rollback_result, result)
 
-    def _handle_builder_result(self, result, is_fix: bool = False) -> None:
+    def _handle_builder_result(self, result, is_fix: bool = False, codex_status_tokens: int | None = None) -> None:
         title = "Builder fix" if is_fix else "Builder"
         if self._handle_stopped_result(title):
             return
         self._builder_status = "success" if result.returncode == 0 else "error"
         self._clear_active_run()
         self._set_message(self._t("builder_done"))
-        self._update_usage("builder", result)
+        self._update_usage("builder", result, codex_status_tokens=codex_status_tokens)
         self._refresh_history_log()
         self._append_activity(title, self._result_summary(result), style="green" if result.returncode == 0 else "red")
         self._update_final_result(title, result, self._builder_status)
         self._refresh_status_card()
+        self._schedule_codex_token_refresh("builder", result, {"fix_result"} if is_fix else {"builder_result"})
 
-    def _handle_reviewer_result(self, result) -> None:
+    def _handle_reviewer_result(self, result, codex_status_tokens: int | None = None) -> None:
         if self._handle_stopped_result("Reviewer"):
             return
         self._reviewer_status = "success" if result.returncode == 0 else "error"
         self._clear_active_run()
         self._set_message(self._t("reviewer_done"))
-        self._update_usage("reviewer", result)
+        self._update_usage("reviewer", result, codex_status_tokens=codex_status_tokens)
         self._refresh_history_log()
         self._append_activity("Reviewer", self._result_summary(result), style="green" if result.returncode == 0 else "red")
         self._update_final_result("Reviewer", result, self._reviewer_status)
         self._refresh_status_card()
+        self._schedule_codex_token_refresh("reviewer", result, {"reviewer_result"})
 
     def _handle_diff_result(self, diff: str) -> None:
         self.workflow.state.status = "success"
@@ -520,11 +529,19 @@ class ConsoleApp(App[None], inherit_css=False):
     def _update_initial_result_widgets(self) -> None:
         if not self._ui_ready:
             return
-        result = self.workflow.state.last_reviewer_result or self.workflow.state.last_builder_result
-        if result is None:
-            return
+        role = self.workflow.state.last_completed_role
+        if role == "reviewer" and self.workflow.state.last_reviewer_result is not None:
+            result = self.workflow.state.last_reviewer_result
+            title = "Reviewer"
+        elif role == "builder" and self.workflow.state.last_builder_result is not None:
+            result = self.workflow.state.last_builder_result
+            title = "Builder"
+        else:
+            result = self.workflow.state.last_reviewer_result or self.workflow.state.last_builder_result
+            if result is None:
+                return
+            title = "Reviewer" if result.role == "reviewer" else "Builder"
         self._live_log().clear()
-        title = "Reviewer" if result.role == "reviewer" else "Builder"
         status = "success" if result.returncode == 0 else "error"
         self._update_final_result(title, result, status)
 
@@ -625,23 +642,120 @@ class ConsoleApp(App[None], inherit_css=False):
     def _append_live_output(self, title: str, stream_name: str, line: str) -> None:
         if not self._ui_ready or not line:
             return
+        # Stream lines are intentionally transient; restore re-renders the last final result from history.
         for output_line in line.splitlines() or [line]:
             style = self._stream_line_style(stream_name, output_line)
             self._live_log().write(self._render_stream_line(title, stream_name, output_line, style))
             if style == "red":
                 self._append_activity(title, self._short_text(output_line, 140), style="red")
 
-    def _update_usage(self, role: str, result) -> None:
+    def _update_usage(self, role: str, result, codex_status_tokens: int | None = None) -> None:
+        self._add_usage(role, result, codex_status_tokens=codex_status_tokens)
+        self._refresh_status_card()
+
+    def _add_usage(self, role: str, result, codex_status_tokens: int | None = None, count_tokens: bool = True) -> None:
         usage = self._usage[role]
         usage["runs"] += 1
         usage["duration"] += result.duration_sec
         usage["stdout"] += len(result.stdout)
         usage["stderr"] += len(result.stderr)
+        if not count_tokens:
+            return
+        if codex_status_tokens is not None:
+            usage["tokens"] = codex_status_tokens
+            usage["tokens_known"] = True
+            return
         tokens = self._extract_token_usage(result.stdout + "\n" + result.stderr)
         if tokens is not None:
             usage["tokens"] += tokens
             usage["tokens_known"] = True
+
+    def _restore_usage_from_history(self) -> None:
+        for record in self.history.read_current_session():
+            event_type = record.get("type")
+            if event_type not in {"builder_result", "fix_result", "reviewer_result"}:
+                continue
+            role = "reviewer" if event_type == "reviewer_result" else "builder"
+            result = SimpleNamespace(
+                agent_name=str(record.get("agent") or ""),
+                stdout=str(record.get("stdout") or ""),
+                stderr=str(record.get("stderr") or ""),
+                duration_sec=float(record.get("duration_sec") or 0.0),
+            )
+            tokens = record.get("tokens")
+            # Codex status reports the active CLI session. After app restart saved codex totals
+            # may describe an old session, so keep them unknown until the next status refresh.
+            codex_status_tokens = (
+                tokens
+                if result.agent_name != "codex" and isinstance(tokens, int) and not isinstance(tokens, bool)
+                else None
+            )
+            self._add_usage(
+                role,
+                result,
+                codex_status_tokens=codex_status_tokens,
+                count_tokens=result.agent_name != "codex" or codex_status_tokens is not None,
+            )
+
+    def _restore_agent_statuses(self) -> None:
+        if self.workflow.state.last_builder_result is not None:
+            self._builder_status = "success" if self.workflow.state.last_builder_result.returncode == 0 else "error"
+        if self.workflow.state.last_reviewer_result is not None:
+            self._reviewer_status = "success" if self.workflow.state.last_reviewer_result.returncode == 0 else "error"
+
+    def _read_codex_status_tokens_for_result(self, result) -> int | None:
+        if getattr(result, "agent_name", "") != "codex":
+            return None
+        if getattr(result, "role", "") == "reviewer":
+            return None
+        try:
+            return self._read_codex_status_tokens()
+        except Exception:
+            return None
+
+    def _read_codex_status_tokens(self) -> int | None:
+        args = [self.settings.codex_bin, "status"]
+        result = run_process(
+            args,
+            cwd=str(self.settings.project_path()),
+            timeout=CODEX_STATUS_TIMEOUT_SEC,
+        )
+        if result.returncode != 0:
+            return None
+        return self._extract_token_usage(result.stdout + "\n" + result.stderr)
+
+    def _schedule_codex_token_refresh(self, role: str, result, event_types: set[str]) -> None:
+        if getattr(result, "agent_name", "") != "codex":
+            return
+        if getattr(result, "role", "") == "reviewer":
+            return
+        self.run_worker(
+            lambda: self._codex_token_refresh_worker(role, event_types),
+            name=f"codex_status_{role}",
+            group="codex_status",
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _codex_token_refresh_worker(self, role: str, event_types: set[str]) -> None:
+        try:
+            tokens = self._read_codex_status_tokens()
+        except Exception:
+            tokens = None
+        self.call_from_thread(self._handle_codex_token_refresh, role, event_types, tokens)
+
+    def _handle_codex_token_refresh(self, role: str, event_types: set[str], tokens: int | None) -> None:
+        if tokens is None:
+            return
+        self._set_usage_tokens(role, tokens)
+        self.workflow.history.update_latest_result_tokens(event_types, tokens)
         self._refresh_status_card()
+        self._refresh_history_log()
+
+    def _set_usage_tokens(self, role: str, tokens: int) -> None:
+        usage = self._usage[role]
+        usage["tokens"] = tokens
+        usage["tokens_known"] = True
 
     def _render_menu_text(self, commands: list[tuple[str, str]]) -> Text:
         text = Text()
@@ -934,23 +1048,22 @@ class ConsoleApp(App[None], inherit_css=False):
 
     @classmethod
     def _extract_token_usage(cls, text: str) -> int | None:
-        totals: list[int] = []
-        totals.extend(cls._extract_json_token_usage(text))
-        text_lines = [
-            line
-            for line in text.splitlines()
-            if not (line.strip().startswith("{") and line.strip().endswith("}"))
-        ]
-        text_without_json = "\n".join(text_lines)
-        totals.extend(cls._extract_text_token_usage(text_without_json))
+        json_totals, text_without_json = cls._extract_json_token_usage_and_text(text)
+        text_totals, text_components = cls._extract_text_token_usage(text_without_json)
 
-        return sum(totals) if totals else None
+        all_totals = [*json_totals, *text_totals]
+        if all_totals:
+            return max(all_totals)
+        if text_components:
+            return sum(text_components)
+        return None
 
     @staticmethod
-    def _extract_text_token_usage(text: str) -> list[int]:
+    def _extract_text_token_usage(text: str) -> tuple[list[int], list[int]]:
         total_context = {"total", "used", "usage", "spent", "consumed"}
         component_context = {"input", "prompt", "output", "completion"}
         token_context = "|".join((*total_context, *component_context))
+        total_token_context = "|".join(total_context)
         context_before_tokens = re.compile(
             rf"\b(?P<context>{token_context})[\s:.-]{{0,16}}(?:tokens?|tok)\D{{0,12}}(?P<tokens>[\d,]+)\b",
             re.IGNORECASE,
@@ -960,42 +1073,59 @@ class ConsoleApp(App[None], inherit_css=False):
             re.IGNORECASE,
         )
         tokens_before_context = re.compile(
-            rf"\b(?P<tokens>[\d,]+)\s+(?:tokens?|tok)\b[\w\s./-]{{0,32}}\b(?P<context>{token_context})\b",
+            rf"\b(?P<tokens>[\d,]+)\s+(?:tokens?|tok)\b[\w\s./-]{{0,32}}\b(?P<context>{total_token_context})\b",
             re.IGNORECASE,
         )
 
         total_values: list[int] = []
         component_values: list[int] = []
         for line in text.splitlines():
-            matches = [
-                (match.group("context").lower(), int(match.group("tokens").replace(",", "")))
-                for pattern in (context_before_tokens, context_before_number, tokens_before_context)
-                for match in pattern.finditer(line)
-            ]
+            matches: list[tuple[str, int]] = []
+            forward_token_spans: list[tuple[int, int]] = []
+            for pattern in (context_before_tokens, context_before_number):
+                for match in pattern.finditer(line):
+                    matches.append((match.group("context").lower(), int(match.group("tokens").replace(",", ""))))
+                    forward_token_spans.append(match.span("tokens"))
+            for match in tokens_before_context.finditer(line):
+                token_span = match.span("tokens")
+                if any(token_span[0] < span[1] and span[0] < token_span[1] for span in forward_token_spans):
+                    continue
+                matches.append((match.group("context").lower(), int(match.group("tokens").replace(",", ""))))
             for context, tokens in matches:
                 if context in total_context:
                     total_values.append(tokens)
                 elif context in component_context:
                     component_values.append(tokens)
-        if total_values:
-            return [max(total_values)]
-        return component_values
+        return total_values, component_values
 
     @staticmethod
     def _extract_json_token_usage(text: str) -> list[int]:
+        totals, _ = ConsoleApp._extract_json_token_usage_and_text(text)
+        return totals
+
+    @staticmethod
+    def _extract_json_token_usage_and_text(text: str) -> tuple[list[int], str]:
+        decoder = json.JSONDecoder()
         totals: list[int] = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not (line.startswith("{") and line.endswith("}")):
+        text_parts: list[str] = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char not in "{[":
+                text_parts.append(char)
+                index += 1
                 continue
             try:
-                value = json.loads(line)
+                value, end = decoder.raw_decode(text, index)
             except json.JSONDecodeError:
+                text_parts.append(char)
+                index += 1
                 continue
             total = ConsoleApp._json_token_total(value)
             if total is not None:
                 totals.append(total)
-        return totals
+            index = end
+        return totals, "".join(text_parts)
 
     @staticmethod
     def _json_token_total(value: object) -> int | None:

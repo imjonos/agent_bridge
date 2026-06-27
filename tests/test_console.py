@@ -5,15 +5,18 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import patch
 
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from agent_bridge.agents.base import AgentResult
 from agent_bridge.config import Settings
 from agent_bridge.services.history import HistoryService
-from agent_bridge.ui.console import ConsoleApp
+from agent_bridge.services.workflow import Workflow
+from agent_bridge.ui.console import CODEX_STATUS_TIMEOUT_SEC, ConsoleApp
 from agent_bridge.ui.translations import DEFAULT_LANGUAGE, TRANSLATIONS
 
 
@@ -32,6 +35,14 @@ class FakeWorkflow:
 
     def set_task(self, text: str) -> None:
         self.state.current_task = text.strip()
+
+
+class StubAgent:
+    name = "stub"
+    role = "builder"
+
+    def run(self, prompt: str, stream_callback=None) -> AgentResult:
+        return AgentResult("stub", "builder", prompt, "", "", 0, 0.0)
 
 
 class ConsoleTests(TestCase):
@@ -143,6 +154,24 @@ class ConsoleTests(TestCase):
 
         self.assertEqual(ConsoleApp._extract_token_usage(text), 1545)
 
+    def test_extract_token_usage_uses_max_for_multiple_json_totals(self) -> None:
+        text = '{"total_tokens": 100}\n{"total_tokens": 250}'
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 250)
+
+    def test_extract_token_usage_reads_multiline_json_without_double_counting(self) -> None:
+        text = """{
+  "usage": {
+    "input_tokens": 1200,
+    "output_tokens": 345
+  }
+}
+input tokens: 10
+output tokens: 20
+"""
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 1545)
+
     def test_extract_token_usage_reads_textual_total(self) -> None:
         text = "Token usage: total tokens: 2,048"
 
@@ -153,10 +182,35 @@ class ConsoleTests(TestCase):
 
         self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
 
+    def test_extract_token_usage_prefers_explicit_total(self) -> None:
+        text = "input: 50 tokens output: 50 tokens total: 100 tokens"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 100)
+
+    def test_extract_token_usage_does_not_use_json_keywords_for_text_total(self) -> None:
+        text = '{"used": 100}\ninput tokens: 50\noutput tokens: 25'
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 75)
+
+    def test_extract_token_usage_prefers_json_total_over_textual_components(self) -> None:
+        text = '{"total_tokens": 5000}\ninput tokens: 50\noutput tokens: 25'
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 5000)
+
+    def test_extract_token_usage_ignores_used_in_prose(self) -> None:
+        text = "The agent used the tool. input tokens: 50 output tokens: 50"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 100)
+
     def test_extract_token_usage_sums_textual_breakdown_without_total(self) -> None:
         text = "Token usage: input tokens: 120 output tokens: 180"
 
         self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
+
+    def test_extract_token_usage_sums_equal_textual_components(self) -> None:
+        text = "Token usage: input tokens: 100 output tokens: 100"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 200)
 
     def test_extract_token_usage_reads_total_before_token_word(self) -> None:
         text = "Total: 2,048 tokens"
@@ -185,6 +239,128 @@ class ConsoleTests(TestCase):
             app._update_usage("builder", result)
 
             self.assertEqual(app._usage["builder"]["tokens"], 300)
+
+    def test_update_usage_prefers_codex_status_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            result = SimpleNamespace(
+                agent_name="codex",
+                stdout="total tokens: 100",
+                stderr="",
+                duration_sec=1.0,
+            )
+            status_result = SimpleNamespace(
+                stdout="total tokens: 250",
+                stderr="",
+                returncode=0,
+            )
+
+            with patch("agent_bridge.ui.console.run_process", return_value=status_result) as run_process_mock:
+                app._update_usage("builder", result, codex_status_tokens=250)
+
+            self.assertEqual(app._usage["builder"]["tokens"], 250)
+            run_process_mock.assert_not_called()
+
+    def test_update_usage_falls_back_when_codex_status_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            result = SimpleNamespace(
+                agent_name="codex",
+                stdout="total tokens: 100",
+                stderr="",
+                duration_sec=1.0,
+            )
+
+            app._update_usage("builder", result, codex_status_tokens=None)
+
+            self.assertEqual(app._usage["builder"]["tokens"], 100)
+            self.assertTrue(app._usage["builder"]["tokens_known"])
+
+    def test_read_codex_status_tokens_uses_status_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            status_result = SimpleNamespace(
+                stdout="total tokens: 250",
+                stderr="",
+                returncode=0,
+            )
+
+            with patch("agent_bridge.ui.console.run_process", return_value=status_result) as run_process_mock:
+                tokens = app._read_codex_status_tokens()
+
+            self.assertEqual(tokens, 250)
+            self.assertEqual(run_process_mock.call_args.kwargs["timeout"], CODEX_STATUS_TIMEOUT_SEC)
+
+    def test_read_codex_status_tokens_uses_top_level_status_without_exec_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            app.settings.codex_base_args = "exec --sandbox workspace-write"
+            status_result = SimpleNamespace(
+                stdout="total tokens: 250",
+                stderr="",
+                returncode=0,
+            )
+
+            with patch("agent_bridge.ui.console.run_process", return_value=status_result) as run_process_mock:
+                app._read_codex_status_tokens()
+
+            self.assertEqual(
+                run_process_mock.call_args.args[0],
+                ["codex", "status"],
+            )
+
+    def test_restore_usage_from_history_does_not_reuse_saved_codex_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            history_dir = project_dir / ".agent-bridge" / "test-history"
+            history_dir.mkdir(parents=True)
+            (history_dir / "2026-06-27_10-00-00.jsonl").write_text(
+                "\n".join(
+                    [
+                        '{"type":"task_created","task":"task"}',
+                        '{"type":"builder_result","agent":"codex","stdout":"","stderr":"","duration_sec":1.0,"tokens":250}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            app = self._make_app(project_dir)
+
+            self.assertEqual(app._usage["builder"]["tokens"], 0)
+            self.assertFalse(app._usage["builder"]["tokens_known"])
+
+    def test_handle_codex_token_refresh_persists_tokens_to_latest_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            app.workflow.history.append("task_created", {"task": "task"})
+            app.workflow.history.append("builder_result", {"agent": "codex", "stdout": ""})
+            history_refreshes = 0
+            app._refresh_status_card = lambda: None  # type: ignore[method-assign]
+
+            def refresh_history_log() -> None:
+                nonlocal history_refreshes
+                history_refreshes += 1
+
+            app._refresh_history_log = refresh_history_log  # type: ignore[method-assign]
+
+            app._handle_codex_token_refresh("builder", {"builder_result"}, 250)
+
+            records = app.workflow.history.read_current_session()
+            self.assertEqual(records[-1]["tokens"], 250)
+            self.assertEqual(app._usage["builder"]["tokens"], 250)
+            self.assertEqual(history_refreshes, 1)
+
+    def test_reviewer_codex_status_tokens_are_not_read_from_global_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            result = SimpleNamespace(agent_name="codex", role="reviewer")
+
+            with patch.object(app, "_read_codex_status_tokens", return_value=250) as status_mock:
+                tokens = app._read_codex_status_tokens_for_result(result)
+
+            self.assertIsNone(tokens)
+            status_mock.assert_not_called()
 
     def test_extract_token_usage_does_not_guess_from_output_length(self) -> None:
         text = "Normal agent output without usage metadata."
@@ -315,3 +491,167 @@ class ConsoleTests(TestCase):
             self.assertEqual(len(panels), 1)
             self.assertIsInstance(panels[0].renderable, Markdown)
             self.assertIn("Builder", str(panels[0].title))
+
+    def test_refresh_ui_renders_last_result_in_live_log(self) -> None:
+        class FakeLog:
+            def __init__(self) -> None:
+                self.entries: list[object] = []
+                self.clear_calls = 0
+
+            def clear(self) -> None:
+                self.clear_calls += 1
+                self.entries.clear()
+
+            def write(self, value: object) -> None:
+                self.entries.append(value)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            log = FakeLog()
+            app._ui_ready = True
+            app._live_log = lambda: log  # type: ignore[method-assign]
+            app.workflow.state.last_reviewer_result = SimpleNamespace(
+                agent_name="opencode",
+                role="reviewer",
+                text="Recovered reviewer output",
+                returncode=0,
+                duration_sec=1.25,
+            )
+
+            app._update_initial_result_widgets()
+
+            panels = [entry for entry in log.entries if isinstance(entry, Panel)]
+            self.assertEqual(log.clear_calls, 1)
+            self.assertEqual(len(panels), 1)
+            self.assertIn("Reviewer", str(panels[0].title))
+            self.assertEqual(panels[0].renderable.markup, "Recovered reviewer output")
+
+    def test_initial_result_widgets_follow_last_completed_role(self) -> None:
+        class FakeLog:
+            def __init__(self) -> None:
+                self.entries: list[object] = []
+                self.clear_calls = 0
+
+            def clear(self) -> None:
+                self.clear_calls += 1
+                self.entries.clear()
+
+            def write(self, value: object) -> None:
+                self.entries.append(value)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            log = FakeLog()
+            app._ui_ready = True
+            app._live_log = lambda: log  # type: ignore[method-assign]
+            app.workflow.state.last_completed_role = "builder"
+            app.workflow.state.last_builder_result = SimpleNamespace(
+                agent_name="codex",
+                role="builder",
+                text="Latest builder fix",
+                returncode=0,
+                duration_sec=1.25,
+            )
+            app.workflow.state.last_reviewer_result = SimpleNamespace(
+                agent_name="opencode",
+                role="reviewer",
+                text="Stale reviewer output",
+                returncode=0,
+                duration_sec=1.0,
+            )
+
+            app._update_initial_result_widgets()
+
+            panels = [entry for entry in log.entries if isinstance(entry, Panel)]
+            self.assertEqual(log.clear_calls, 1)
+            self.assertEqual(len(panels), 1)
+            self.assertIn("Builder", str(panels[0].title))
+            self.assertEqual(panels[0].renderable.markup, "Latest builder fix")
+
+    def test_restart_restores_task_and_last_result_into_console_widgets(self) -> None:
+        class FakeLog:
+            def __init__(self) -> None:
+                self.entries: list[object] = []
+                self.clear_calls = 0
+
+            def clear(self) -> None:
+                self.clear_calls += 1
+                self.entries.clear()
+
+            def write(self, value: object) -> None:
+                self.entries.append(value)
+
+        class FakeEditor:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def load_text(self, text: str) -> None:
+                self.text = text
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            history_dir = project_dir / ".agent-bridge" / "test-history"
+            history_dir.mkdir(parents=True)
+            (history_dir / "2026-06-27_10-00-00.jsonl").write_text(
+                "\n".join(
+                    [
+                        '{"type":"task_created","task":"Persisted task"}',
+                        '{"type":"builder_result","agent":"codex","role":"builder","stdout":"Builder output","stderr":"","returncode":0,"duration_sec":1.0}',
+                        '{"type":"reviewer_result","agent":"opencode","role":"reviewer","stdout":"Recovered reviewer output","stderr":"","returncode":0,"duration_sec":1.0}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            settings = Settings(project_dir=str(project_dir))
+            history = HistoryService(history_dir)
+            workflow = Workflow(settings, StubAgent(), StubAgent(), history)
+            app = ConsoleApp(settings=settings, workflow=workflow, history=history)
+            log = FakeLog()
+            editor = FakeEditor()
+            app._ui_ready = True
+            app._live_log = lambda: log  # type: ignore[method-assign]
+            app._task_editor = lambda: editor  # type: ignore[method-assign]
+            app._refresh_status_card = lambda: None  # type: ignore[method-assign]
+            app._refresh_config_card = lambda: None  # type: ignore[method-assign]
+            app._refresh_history_log = lambda: None  # type: ignore[method-assign]
+
+            app._refresh_ui()
+
+            panels = [entry for entry in log.entries if isinstance(entry, Panel)]
+            self.assertEqual(workflow.state.current_task, "Persisted task")
+            self.assertEqual(editor.text, "Persisted task")
+            self.assertEqual(log.clear_calls, 1)
+            self.assertEqual(len(panels), 1)
+            self.assertIn("Reviewer", str(panels[0].title))
+            self.assertEqual(panels[0].renderable.markup, "Recovered reviewer output")
+
+    def test_restore_agent_statuses_uses_restored_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            app.workflow.state.last_builder_result = SimpleNamespace(returncode=0)
+            app.workflow.state.last_reviewer_result = SimpleNamespace(returncode=1)
+
+            app._restore_agent_statuses()
+
+            self.assertEqual(app._builder_status, "success")
+            self.assertEqual(app._reviewer_status, "error")
+
+    def test_new_task_persists_clear_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            app = self._make_app(Path(tmp_dir))
+            cleared = False
+
+            app._task_editor = lambda: SimpleNamespace(clear=lambda: None, focus=lambda: None)  # type: ignore[method-assign]
+            app._refresh_ui = lambda: None  # type: ignore[method-assign]
+            app._append_activity = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+            def append(event_type: str, payload=None) -> None:
+                nonlocal cleared
+                cleared = event_type == "task_cleared"
+
+            app.workflow.history.append = append  # type: ignore[method-assign]
+
+            app.action_new_task()
+
+            self.assertTrue(cleared)
