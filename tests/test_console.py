@@ -227,6 +227,11 @@ output tokens: 20
 
         self.assertEqual(ConsoleApp._extract_token_usage(text), 300)
 
+    def test_extract_token_usage_reads_codex_tokens_used_summary(self) -> None:
+        text = "some stderr\n\ntokens used\n56\u00a0340\n"
+
+        self.assertEqual(ConsoleApp._extract_token_usage(text), 56340)
+
     def test_update_usage_dedupes_total_repeated_in_stdout_and_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             app = self._make_app(Path(tmp_dir))
@@ -309,7 +314,7 @@ output tokens: 20
                 ["codex", "status"],
             )
 
-    def test_restore_usage_from_history_does_not_reuse_saved_codex_tokens(self) -> None:
+    def test_restore_usage_from_history_reuses_saved_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
             history_dir = project_dir / ".agent-bridge" / "test-history"
@@ -319,6 +324,7 @@ output tokens: 20
                     [
                         '{"type":"task_created","task":"task"}',
                         '{"type":"builder_result","agent":"codex","stdout":"","stderr":"","duration_sec":1.0,"tokens":250}',
+                        '{"type":"reviewer_result","agent":"opencode","stdout":"","stderr":"","duration_sec":2.0,"tokens":120}',
                     ]
                 )
                 + "\n",
@@ -327,8 +333,31 @@ output tokens: 20
 
             app = self._make_app(project_dir)
 
-            self.assertEqual(app._usage["builder"]["tokens"], 0)
-            self.assertFalse(app._usage["builder"]["tokens_known"])
+            self.assertEqual(app._usage["builder"]["tokens"], 250)
+            self.assertTrue(app._usage["builder"]["tokens_known"])
+            self.assertEqual(app._usage["reviewer"]["tokens"], 120)
+            self.assertTrue(app._usage["reviewer"]["tokens_known"])
+
+    def test_restore_usage_from_history_parses_codex_output_without_saved_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            history_dir = project_dir / ".agent-bridge" / "test-history"
+            history_dir.mkdir(parents=True)
+            (history_dir / "2026-06-27_10-00-00.jsonl").write_text(
+                "\n".join(
+                    [
+                        '{"type":"task_created","task":"task"}',
+                        '{"type":"builder_result","agent":"codex","stdout":"","stderr":"tokens used\\n56\\u00a0340","duration_sec":1.0}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            app = self._make_app(project_dir)
+
+            self.assertEqual(app._usage["builder"]["tokens"], 56340)
+            self.assertTrue(app._usage["builder"]["tokens_known"])
 
     def test_handle_codex_token_refresh_persists_tokens_to_latest_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

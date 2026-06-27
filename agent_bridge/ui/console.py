@@ -683,18 +683,12 @@ class ConsoleApp(App[None], inherit_css=False):
                 duration_sec=float(record.get("duration_sec") or 0.0),
             )
             tokens = record.get("tokens")
-            # Codex status reports the active CLI session. After app restart saved codex totals
-            # may describe an old session, so keep them unknown until the next status refresh.
-            codex_status_tokens = (
-                tokens
-                if result.agent_name != "codex" and isinstance(tokens, int) and not isinstance(tokens, bool)
-                else None
-            )
+            saved_tokens = tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None
             self._add_usage(
                 role,
                 result,
-                codex_status_tokens=codex_status_tokens,
-                count_tokens=result.agent_name != "codex" or codex_status_tokens is not None,
+                codex_status_tokens=saved_tokens,
+                count_tokens=True,
             )
 
     def _restore_agent_statuses(self) -> None:
@@ -1079,24 +1073,37 @@ class ConsoleApp(App[None], inherit_css=False):
 
         total_values: list[int] = []
         component_values: list[int] = []
+        previous_token_usage_context: str | None = None
+        number_with_separators = re.compile(r"^\s*(?P<tokens>\d[\d,\s\u00a0]*)\s*$")
         for line in text.splitlines():
             matches: list[tuple[str, int]] = []
             forward_token_spans: list[tuple[int, int]] = []
             for pattern in (context_before_tokens, context_before_number):
                 for match in pattern.finditer(line):
-                    matches.append((match.group("context").lower(), int(match.group("tokens").replace(",", ""))))
+                    matches.append((match.group("context").lower(), ConsoleApp._parse_token_number(match.group("tokens"))))
                     forward_token_spans.append(match.span("tokens"))
             for match in tokens_before_context.finditer(line):
                 token_span = match.span("tokens")
                 if any(token_span[0] < span[1] and span[0] < token_span[1] for span in forward_token_spans):
                     continue
-                matches.append((match.group("context").lower(), int(match.group("tokens").replace(",", ""))))
+                matches.append((match.group("context").lower(), ConsoleApp._parse_token_number(match.group("tokens"))))
+            if previous_token_usage_context is not None:
+                number_match = number_with_separators.match(line)
+                if number_match is not None:
+                    matches.append((previous_token_usage_context, ConsoleApp._parse_token_number(number_match.group("tokens"))))
+                previous_token_usage_context = None
+            if re.search(r"\b(?:tokens?|tok)\s+(?P<context>used|usage|spent|consumed|total)\b\s*:?\s*$", line, re.IGNORECASE):
+                previous_token_usage_context = "total"
             for context, tokens in matches:
                 if context in total_context:
                     total_values.append(tokens)
                 elif context in component_context:
                     component_values.append(tokens)
         return total_values, component_values
+
+    @staticmethod
+    def _parse_token_number(value: str) -> int:
+        return int(re.sub(r"[,\s\u00a0]", "", value))
 
     @staticmethod
     def _extract_json_token_usage(text: str) -> list[int]:

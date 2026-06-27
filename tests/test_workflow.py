@@ -8,6 +8,7 @@ from unittest import TestCase
 
 from agent_bridge.agents.base import AgentResult
 from agent_bridge.config import Settings
+from agent_bridge.prompts.templates import build_reviewer_prompt
 from agent_bridge.services.history import HistoryService
 from agent_bridge.services.workflow import Workflow, WorkflowError
 
@@ -29,6 +30,18 @@ class StubAgent:
 
 
 class WorkflowTests(TestCase):
+    def test_reviewer_prompt_blocks_only_required_fixes(self) -> None:
+        prompt = build_reviewer_prompt(
+            task="Implement feature",
+            builder_output="Done",
+            git_status="M file.py",
+            git_diff="+change",
+        )
+
+        self.assertIn("Проверить только блокирующие проблемы", prompt)
+        self.assertIn("Не блокировать результат из-за вкусовых предпочтений", prompt)
+        self.assertIn("Если блокирующих проблем нет", prompt)
+
     def test_builder_reviewer_flow_and_ok_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
