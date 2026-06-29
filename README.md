@@ -132,3 +132,7 @@ REVIEWER_AGENT=opencode
 - Add support for more AI coding agents beyond Codex and OpenCode.
 - Add more workflow automation options while keeping manual control available.
 - Improve history browsing and project-level reporting.
+
+## License
+
+Agent Bridge is distributed under the MIT License. See [LICENSE](LICENSE).
