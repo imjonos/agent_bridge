@@ -8,6 +8,8 @@ Agent Bridge is a console Python application for running a manual workflow betwe
 
 The UI is built with Textual. The left side contains the current task editor and session timeline, while the right side shows live output from the active process. The top panel shows status, selected agent pair, project path, timeout, language, and test command.
 
+![img.png](img.png)
+
 ## Requirements
 
 - Python 3.11+
